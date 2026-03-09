@@ -41,3 +41,13 @@ module load ffmpeg
 uv sync
 source .venv/bin/activate
 ```
+
+## Model Download
+
+This project uses [Qwen2.5-Omni-7B-GPTQ-Int4](https://huggingface.co/Qwen/Qwen2.5-Omni-7B-GPTQ-Int4), a 4-bit quantized version of the Qwen2.5-Omni 7B model. Download it into the project root:
+
+```bash
+huggingface-cli download Qwen/Qwen2.5-Omni-7B-GPTQ-Int4 --local-dir ./Qwen2.5-Omni-7B-GPTQ-Int4
+```
+
+The model will be saved to `./Qwen2.5-Omni-7B-GPTQ-Int4`, which is the default path used by `evaluate.py`. To use a different location, pass `--model_path` when running evaluation.

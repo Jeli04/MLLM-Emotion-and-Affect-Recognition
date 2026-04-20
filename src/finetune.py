@@ -41,12 +41,31 @@ def parse_args():
     parser.add_argument("--corrupt", action="store_true", default=True,
                         help="Apply noise/corruption to raw inputs")
     parser.add_argument("--no_corrupt", dest="corrupt", action="store_false")
+
+    # W&B args
+    parser.add_argument("--wandb", dest="wandb", action="store_true", default=True,
+                        help="Enable Weights & Biases logging")
+    parser.add_argument("--no_wandb", dest="wandb", action="store_false",
+                        help="Disable Weights & Biases logging")
+    parser.add_argument("--wandb_project", type=str, default="qwen25-omni-meld",
+                        help="W&B project name")
+    parser.add_argument("--wandb_entity", type=str, default=None,
+                        help="W&B entity/team name")
+    parser.add_argument("--wandb_run_name", type=str, default=None,
+                        help="Optional W&B run name")
+
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
-    print(f"Finetuning with modalities={args.modalities}, corrupt={args.corrupt}")
+    print(f"Finetuning with modalities={args.modalities}, corrupt={args.corrupt}, wandb={args.wandb}")
+
+    # Set W&B env vars before Trainer is created
+    if args.wandb:
+        os.environ["WANDB_PROJECT"] = args.wandb_project
+        if args.wandb_entity is not None:
+            os.environ["WANDB_ENTITY"] = args.wandb_entity
 
     processor = Qwen2_5OmniProcessor.from_pretrained(args.model_path)
     model = Qwen2_5OmniForConditionalGeneration.from_pretrained(
@@ -62,10 +81,20 @@ def main():
         target_modules=["q_proj", "v_proj"],
         task_type=TaskType.CAUSAL_LM,
     )
-    # Qwen2_5OmniForConditionalGeneration is an orchestrator with no trainable
-    # forward — wrap and train the text-generating submodule (`thinker`).
+
     thinker = get_peft_model(model.thinker, lora_config)
-    model.thinker = thinker
+
+    # remove unused speech-generation side
+    if hasattr(model, "talker"):
+        del model.talker
+    if hasattr(model, "token2wav"):
+        del model.token2wav
+    if hasattr(model, "audio_tokenizer"):
+        del model.audio_tokenizer
+    del model
+    torch.cuda.empty_cache()
+
+    thinker.gradient_checkpointing_enable()
     thinker.print_trainable_parameters()
 
     common = dict(
@@ -83,6 +112,8 @@ def main():
         padding_side="right",
     )
 
+    run_name = args.wandb_run_name or os.path.basename(os.path.abspath(args.output_dir))
+
     training_args = TrainingArguments(
         output_dir=args.output_dir,
         num_train_epochs=args.num_epochs,
@@ -98,7 +129,8 @@ def main():
         eval_strategy="steps",
         eval_steps=args.save_steps,
         fp16=True,
-        report_to="none",
+        report_to="wandb" if args.wandb else "none",
+        run_name=run_name,
         remove_unused_columns=False,
         dataloader_num_workers=0,
     )

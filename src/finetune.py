@@ -1,4 +1,5 @@
 import argparse
+import logging
 import os
 from functools import partial
 
@@ -10,6 +11,10 @@ from transformers import (
     Trainer,
 )
 from peft import LoraConfig, get_peft_model, TaskType
+
+logging.getLogger().addFilter(
+    lambda r: "System prompt modified" not in r.getMessage()
+)
 
 # Patch optimum to recognize Qwen2.5-Omni's layer structure
 import optimum.gptq.constants
@@ -78,7 +83,7 @@ def main():
         r=args.lora_r,
         lora_alpha=args.lora_alpha,
         lora_dropout=args.lora_dropout,
-        target_modules=["q_proj", "v_proj"],
+        target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],#["q_proj", "v_proj"],
         task_type=TaskType.CAUSAL_LM,
     )
 

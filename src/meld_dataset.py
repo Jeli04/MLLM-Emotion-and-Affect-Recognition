@@ -307,21 +307,31 @@ class CorruptedMELDDataset(Dataset):
             )
             prompt_rendered = None
 
-        # Load and optionally corrupt raw media
+        # Load and optionally corrupt raw media.
+        # If a file is missing or unreadable, fall back to a zero-filled tensor
+        # so the sample still contributes (with padding) rather than crashing.
         videos = None
         audio = None
         has_video = "video" in self.modalities
         has_audio = "audio" in self.modalities or has_video
 
         if has_video:
-            frames = self._load_video_frames(sample["video_path"], self.fps)
+            try:
+                frames = self._load_video_frames(sample["video_path"], self.fps)
+            except Exception:
+                # 2 black frames (minimum for temporal_patch_size=2), 224×224 RGB
+                frames = np.zeros((2, 224, 224, 3), dtype=np.uint8)
             if self.corrupt:
                 noise = np.random.randn(*frames.shape).astype(np.float32) * self.video_noise_level * 255
                 frames = np.clip(frames.astype(np.float32) + noise, 0, 255).astype(np.uint8)
             videos = [frames]
 
         if has_audio:
-            waveform, _ = load_audio_from_video(sample["video_path"], target_sr=self.audio_sr)
+            try:
+                waveform, _ = load_audio_from_video(sample["video_path"], target_sr=self.audio_sr)
+            except Exception:
+                # 1 second of silence at the target sample rate
+                waveform = np.zeros(self.audio_sr, dtype=np.float32)
             if self.corrupt:
                 waveform = corrupt_audio(waveform, noise_level=self.audio_noise_level)
             audio = [waveform]
@@ -347,7 +357,6 @@ class CorruptedMELDDataset(Dataset):
 
         # Only squeeze keys that carry a real batch dim from the processor.
         # Video/audio "count" dims (video_grid_thw, video_second_per_grid, pixel_values_videos)
-        # are semantic, not batch — squeezing them breaks collation when N=1.
         BATCH_DIM_KEYS = {"input_ids", "attention_mask", "input_features", "feature_attention_mask"}
         result = {
             k: (v.squeeze(0) if isinstance(v, torch.Tensor) and k in BATCH_DIM_KEYS else v)

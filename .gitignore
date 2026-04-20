@@ -1,5 +1,4 @@
 Qwen2.5-Omni-7B-GPTQ-Int4/
 slurm_logs/
 test*.py
-
 __pycache__/

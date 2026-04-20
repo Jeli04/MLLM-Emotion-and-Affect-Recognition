@@ -20,7 +20,7 @@ from sklearn.preprocessing import label_binarize
 import optimum.gptq.constants
 optimum.gptq.constants.BLOCK_PATTERNS.insert(0, "thinker.model.layers")
 
-from datasets.meld_dataset import RawMELDDataset, EMOTION2ID
+from src.meld_dataset import RawMELDDataset, EMOTION2ID
 
 ID2EMOTION = {v: k for k, v in EMOTION2ID.items()}
 VALID_EMOTIONS = set(EMOTION2ID.keys())
@@ -41,7 +41,7 @@ def parse_args():
                         help="Dataset split to evaluate on (default: test)")
     parser.add_argument("--data_root", default="/project2/robinjia_875/lijc/data/MELD.Raw",
                         help="Path to MELD.Raw directory")
-    parser.add_argument("--model_path", default="./Qwen2.5-Omni-7B-GPTQ-Int4",
+    parser.add_argument("--model_path", default="./ckpts/Qwen2.5-Omni-7B-GPTQ-Int4",
                         help="Path to the model")
     return parser.parse_args()
 

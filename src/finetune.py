@@ -4,6 +4,7 @@ import os
 from functools import partial
 
 import torch
+import torch.nn.functional as F
 from transformers import (
     Qwen2_5OmniForConditionalGeneration,
     Qwen2_5OmniProcessor,
@@ -21,6 +22,68 @@ import optimum.gptq.constants
 optimum.gptq.constants.BLOCK_PATTERNS.insert(0, "thinker.model.layers")
 
 from src.meld_dataset import CorruptedMELDDataset, collate_fn
+
+
+class StudentTeacherTrainer(Trainer):
+    """Trainer that applies CE + λ·KL(sg(p_full) || p_mask) when inputs are
+    paired {"full": ..., "mask": ...} dicts. Falls back to the default CE path
+    for unpaired inputs, so non-distill runs are unaffected.
+    """
+
+    def __init__(self, *args, lambda_kl=1.0, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.lambda_kl = lambda_kl
+
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        if "full" not in inputs or "mask" not in inputs:
+            return super().compute_loss(
+                model, inputs,
+                return_outputs=return_outputs,
+                num_items_in_batch=num_items_in_batch,
+            )
+
+        full_inputs = {k: v for k, v in inputs["full"].items() if k != "labels"}
+        mask_inputs = inputs["mask"]
+
+        with torch.no_grad():
+            full_out = model(**full_inputs)
+
+        mask_out = model(**mask_inputs)
+        ce_loss = mask_out.loss
+
+        def response_logits(logits, labels):
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+            keep = shift_labels != -100
+            return shift_logits[keep]
+
+        student_resp = response_logits(mask_out.logits, mask_inputs["labels"])
+        teacher_resp = response_logits(full_out.logits, inputs["full"]["labels"]).detach()
+
+        if student_resp.numel() == 0 or student_resp.shape != teacher_resp.shape:
+            loss = ce_loss
+            kl_val = torch.zeros((), device=ce_loss.device)
+        else:
+            # KL in fp32 for numerical stability under fp16 training.
+            log_p_mask = F.log_softmax(student_resp.float(), dim=-1)
+            p_full = F.softmax(teacher_resp.float(), dim=-1)
+            kl = F.kl_div(log_p_mask, p_full, reduction="batchmean")
+            loss = ce_loss + self.lambda_kl * kl
+            kl_val = kl.detach()
+
+        self._last_ce = ce_loss.detach()
+        self._last_kl = kl_val
+
+        return (loss, mask_out) if return_outputs else loss
+
+    def log(self, logs, *args, **kwargs):
+        if hasattr(self, "_last_ce"):
+            logs = {
+                **logs,
+                "loss/ce": float(self._last_ce),
+                "loss/kl": float(self._last_kl),
+            }
+        return super().log(logs, *args, **kwargs)
 
 
 def parse_args():
@@ -47,6 +110,13 @@ def parse_args():
                         help="Apply noise/corruption to raw inputs")
     parser.add_argument("--no_corrupt", dest="corrupt", action="store_false")
 
+    parser.add_argument("--distill", action="store_true", default=False,
+                        help="Enable student-teacher distillation: two forward passes "
+                             "per sample (full modalities vs. random masked subset), "
+                             "loss = CE(student) + lambda_kl * KL(sg(p_full) || p_mask).")
+    parser.add_argument("--lambda_kl", type=float, default=1.0,
+                        help="Weight on the KL consistency term when --distill is set")
+
     # W&B args
     parser.add_argument("--wandb", dest="wandb", action="store_true", default=True,
                         help="Enable Weights & Biases logging")
@@ -64,7 +134,10 @@ def parse_args():
 
 def main():
     args = parse_args()
-    print(f"Finetuning with modalities={args.modalities}, corrupt={args.corrupt}, wandb={args.wandb}")
+    print(
+        f"Finetuning with modalities={args.modalities}, corrupt={args.corrupt}, "
+        f"distill={args.distill}, lambda_kl={args.lambda_kl}, wandb={args.wandb}"
+    )
 
     # Set W&B env vars before Trainer is created
     if args.wandb:
@@ -107,6 +180,7 @@ def main():
         modalities=tuple(args.modalities),
         corrupt=args.corrupt,
         for_training=True,
+        distill=args.distill,
     )
     train_dataset = CorruptedMELDDataset(args.data_root, split="train", **common)
     val_dataset = CorruptedMELDDataset(args.data_root, split="dev", **common)
@@ -140,12 +214,13 @@ def main():
         dataloader_num_workers=0,
     )
 
-    trainer = Trainer(
+    trainer = StudentTeacherTrainer(
         model=thinker,
         args=training_args,
         train_dataset=train_dataset,
         eval_dataset=val_dataset,
         data_collator=data_collator,
+        lambda_kl=args.lambda_kl,
     )
 
     trainer.train()

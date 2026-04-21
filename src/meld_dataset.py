@@ -241,6 +241,12 @@ class CorruptedMELDDataset(Dataset):
 
     Loads raw video frames, audio waveforms, and text, applies corruption,
     then runs the processor to produce model-ready inputs.
+
+    When `distill=True` and len(modalities) >= 2, __getitem__ returns a paired
+    {"full": ..., "mask": ...} dict: the full item uses all modalities, the
+    mask item uses a random non-empty strict subset. Media is loaded and
+    corrupted once and shared across both passes, so the only difference
+    between teacher and student inputs is which modalities are present.
     """
 
     def __init__(
@@ -257,6 +263,7 @@ class CorruptedMELDDataset(Dataset):
         audio_noise_level=0.05,
         video_noise_level=0.05,
         for_training=False,
+        distill=False,
     ):
         self.raw_dataset = RawMELDDataset(
             meld_root, split=split, load_audio=False, audio_sr=audio_sr,
@@ -271,6 +278,7 @@ class CorruptedMELDDataset(Dataset):
         self.audio_noise_level = audio_noise_level
         self.video_noise_level = video_noise_level
         self.for_training = for_training
+        self.distill = distill
 
     def __len__(self):
         return len(self.raw_dataset)
@@ -278,22 +286,16 @@ class CorruptedMELDDataset(Dataset):
     def _load_video_frames(self, video_path, fps):
         return load_video_frames(video_path, fps=fps)
 
-    def __getitem__(self, idx):
-        sample = self.raw_dataset[idx]
+    def _process(self, sample, text, frames, waveform, modalities):
+        """Render chat + run processor for one modality configuration.
 
-        # Text corruption
-        text = sample["text"]
-        if self.corrupt and "text" in self.modalities:
-            text = corrupt_text(
-                text,
-                char_swap_prob=self.text_char_swap_prob,
-                word_drop_prob=self.text_word_drop_prob,
-            )
+        `frames` / `waveform` are pre-loaded (and pre-corrupted) raw media or
+        None; this method only includes them if `modalities` asks for them.
+        """
+        has_video = "video" in modalities
+        has_audio = "audio" in modalities or has_video
 
-        # Build messages and render chat template (text only, no media loading).
-        # Training needs the assistant response IN the sequence + a way to mask
-        # prompt tokens from the loss; inference needs the generation prompt.
-        messages = build_messages({**sample, "text": text}, self.modalities)
+        messages = build_messages({**sample, "text": text}, modalities)
         if self.for_training:
             rendered_text = self.processor.apply_chat_template(
                 messages, tokenize=False, add_generation_prompt=False,
@@ -307,36 +309,9 @@ class CorruptedMELDDataset(Dataset):
             )
             prompt_rendered = None
 
-        # Load and optionally corrupt raw media.
-        # If a file is missing or unreadable, fall back to a zero-filled tensor
-        # so the sample still contributes (with padding) rather than crashing.
-        videos = None
-        audio = None
-        has_video = "video" in self.modalities
-        has_audio = "audio" in self.modalities or has_video
+        videos = [frames] if (has_video and frames is not None) else None
+        audio = [waveform] if (has_audio and waveform is not None) else None
 
-        if has_video:
-            try:
-                frames = self._load_video_frames(sample["video_path"], self.fps)
-            except Exception:
-                # 2 black frames (minimum for temporal_patch_size=2), 224×224 RGB
-                frames = np.zeros((2, 224, 224, 3), dtype=np.uint8)
-            if self.corrupt:
-                noise = np.random.randn(*frames.shape).astype(np.float32) * self.video_noise_level * 255
-                frames = np.clip(frames.astype(np.float32) + noise, 0, 255).astype(np.uint8)
-            videos = [frames]
-
-        if has_audio:
-            try:
-                waveform, _ = load_audio_from_video(sample["video_path"], target_sr=self.audio_sr)
-            except Exception:
-                # 1 second of silence at the target sample rate
-                waveform = np.zeros(self.audio_sr, dtype=np.float32)
-            if self.corrupt:
-                waveform = corrupt_audio(waveform, noise_level=self.audio_noise_level)
-            audio = [waveform]
-
-        # Run processor on corrupted raw data
         processor_kwargs = dict(
             videos=videos,
             audio=audio,
@@ -350,35 +325,87 @@ class CorruptedMELDDataset(Dataset):
 
         prompt_len = None
         if self.for_training:
-            # Second pass over the prompt-only text with identical media gives the
-            # exact token count that precedes the assistant response in `inputs`.
             prompt_inputs = self.processor(text=prompt_rendered, **processor_kwargs)
             prompt_len = int(prompt_inputs["input_ids"].shape[-1])
 
         # Only squeeze keys that carry a real batch dim from the processor.
         # Video/audio "count" dims (video_grid_thw, video_second_per_grid, pixel_values_videos)
+        # are semantic, not batch — squeezing them breaks collation when N=1.
         BATCH_DIM_KEYS = {"input_ids", "attention_mask", "input_features", "feature_attention_mask"}
         result = {
             k: (v.squeeze(0) if isinstance(v, torch.Tensor) and k in BATCH_DIM_KEYS else v)
             for k, v in inputs.items()
         }
-        result["emotion"] = sample["emotion"]
-        result["label"] = sample["label"]
         if prompt_len is not None:
             result["prompt_len"] = prompt_len
         return result
 
+    def _sample_kept_modalities(self):
+        mods = list(self.modalities)
+        num_to_mask = random.randint(1, len(mods))
+        dropped = set(random.sample(mods, num_to_mask))
+        return [m for m in mods if m not in dropped]
 
-def collate_fn(batch, pad_token_id, padding_side="left", label_pad_id=-100):
-    """Collate per-sample dicts from CorruptedMELDDataset into a padded batch.
+    def __getitem__(self, idx):
+        sample = self.raw_dataset[idx]
 
-    Text is padded to max length; video patches and grid_thw are concatenated
-    along dim 0 (token-packed, not stackable); audio features are right-padded
-    along the frames dim.
+        # Corrupt-once: applied before the split so teacher and student see
+        # identical media; only modality presence differs between the two.
+        text = sample["text"]
+        if self.corrupt and "text" in self.modalities:
+            text = corrupt_text(
+                text,
+                char_swap_prob=self.text_char_swap_prob,
+                word_drop_prob=self.text_word_drop_prob,
+            )
 
-    If samples carry `prompt_len`, builds an HF-Trainer-ready `labels` tensor
-    where prompt and padding positions are masked to `label_pad_id`.
-    """
+        # If a file is missing or unreadable, fall back to a zero-filled tensor
+        # so the sample still contributes (with padding) rather than crashing.
+        frames = None
+        waveform = None
+        if "video" in self.modalities:
+            try:
+                frames = self._load_video_frames(sample["video_path"], self.fps)
+            except Exception:
+                # 2 black frames (minimum for temporal_patch_size=2), 224×224 RGB
+                frames = np.zeros((2, 224, 224, 3), dtype=np.uint8)
+            if self.corrupt:
+                noise = np.random.randn(*frames.shape).astype(np.float32) * self.video_noise_level * 255
+                frames = np.clip(frames.astype(np.float32) + noise, 0, 255).astype(np.uint8)
+        if "audio" in self.modalities or "video" in self.modalities:
+            try:
+                waveform, _ = load_audio_from_video(sample["video_path"], target_sr=self.audio_sr)
+            except Exception:
+                # 1 second of silence at the target sample rate
+                waveform = np.zeros(self.audio_sr, dtype=np.float32)
+            if self.corrupt:
+                waveform = corrupt_audio(waveform, noise_level=self.audio_noise_level)
+
+        if self.distill:
+            full_item = self._process(sample, text, frames, waveform, self.modalities)
+            full_item["emotion"] = sample["emotion"]
+            full_item["label"] = sample["label"]
+
+            kept = self._sample_kept_modalities()
+            mask_item = self._process(sample, text, frames, waveform, kept)
+            mask_item["emotion"] = sample["emotion"]
+            mask_item["label"] = sample["label"]
+
+            return {
+                "full": full_item,
+                "mask": mask_item,
+                "emotion": sample["emotion"],
+                "label": sample["label"],
+            }
+
+        result = self._process(sample, text, frames, waveform, self.modalities)
+        result["emotion"] = sample["emotion"]
+        result["label"] = sample["label"]
+        return result
+
+
+def _collate_single(batch, pad_token_id, padding_side, label_pad_id):
+    """Collate a flat list of per-sample dicts (no 'full'/'mask' nesting)."""
     def pad_1d(seqs, pad_value):
         max_len = max(s.size(0) for s in seqs)
         out = []
@@ -406,21 +433,25 @@ def collate_fn(batch, pad_token_id, padding_side="left", label_pad_id=-100):
         "attention_mask": pad_1d([b["attention_mask"] for b in batch], 0),
     }
 
-    if "pixel_values_videos" in batch[0]:
-        out["pixel_values_videos"] = torch.cat([b["pixel_values_videos"] for b in batch], dim=0)
-        out["video_grid_thw"] = torch.cat([b["video_grid_thw"] for b in batch], dim=0)
-        if "video_second_per_grid" in batch[0]:
-            vals = [b["video_second_per_grid"] for b in batch]
+    # Guard against samples in a batch with different modality presence: in
+    # distill mode the mask variant may omit video/audio for some samples.
+    video_samples = [b for b in batch if "pixel_values_videos" in b]
+    if video_samples:
+        out["pixel_values_videos"] = torch.cat([b["pixel_values_videos"] for b in video_samples], dim=0)
+        out["video_grid_thw"] = torch.cat([b["video_grid_thw"] for b in video_samples], dim=0)
+        if "video_second_per_grid" in video_samples[0]:
+            vals = [b["video_second_per_grid"] for b in video_samples]
             if isinstance(vals[0], torch.Tensor):
                 out["video_second_per_grid"] = torch.cat(vals, dim=0)
             else:
                 out["video_second_per_grid"] = [v for sub in vals for v in sub]
 
-    if "input_features" in batch[0]:
-        out["input_features"] = pad_last([b["input_features"] for b in batch], 0.0)
-        if "feature_attention_mask" in batch[0]:
+    audio_samples = [b for b in batch if "input_features" in b]
+    if audio_samples:
+        out["input_features"] = pad_last([b["input_features"] for b in audio_samples], 0.0)
+        if "feature_attention_mask" in audio_samples[0]:
             out["feature_attention_mask"] = pad_last(
-                [b["feature_attention_mask"] for b in batch], 0,
+                [b["feature_attention_mask"] for b in audio_samples], 0,
             )
 
     if "prompt_len" in batch[0]:
@@ -438,6 +469,32 @@ def collate_fn(batch, pad_token_id, padding_side="left", label_pad_id=-100):
         out["labels"] = labels
 
     return out
+
+
+def collate_fn(batch, pad_token_id, padding_side="left", label_pad_id=-100):
+    """Collate per-sample dicts from CorruptedMELDDataset into a padded batch.
+
+    Text is padded to max length; video patches and grid_thw are concatenated
+    along dim 0 (token-packed, not stackable); audio features are right-padded
+    along the frames dim.
+
+    If samples carry `prompt_len`, builds an HF-Trainer-ready `labels` tensor
+    where prompt and padding positions are masked to `label_pad_id`.
+
+    If samples are paired {"full": ..., "mask": ...} (distill mode), returns
+    {"full": <collated>, "mask": <collated>, "labels": <mask labels>}. The
+    top-level "labels" key exists so HF Trainer's num_items_in_batch
+    accounting can find a labels tensor.
+    """
+    if "full" in batch[0]:
+        full = _collate_single([b["full"] for b in batch], pad_token_id, padding_side, label_pad_id)
+        mask = _collate_single([b["mask"] for b in batch], pad_token_id, padding_side, label_pad_id)
+        out = {"full": full, "mask": mask}
+        if "labels" in mask:
+            out["labels"] = mask["labels"]
+        return out
+
+    return _collate_single(batch, pad_token_id, padding_side, label_pad_id)
 
 
 if __name__ == "__main__":

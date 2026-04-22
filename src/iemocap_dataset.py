@@ -373,15 +373,18 @@ class CorruptedIEMOCAPDataset(Dataset):
                 messages[:-1], tokenize=False, add_generation_prompt=True,
             )
         else:
+            # Evaluation should not include the assistant label turn; otherwise
+            # the ground-truth emotion leaks into the model input prompt.
             rendered_text = self.processor.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True,
+                messages[:-1], tokenize=False, add_generation_prompt=True,
             )
             prompt_rendered = None
 
         videos = None
         audio = None
         has_video = "video" in self.modalities
-        has_audio = "audio" in self.modalities or has_video
+        # Keep video-only runs visual-only unless audio is explicitly requested.
+        has_audio = "audio" in self.modalities
 
         if has_video:
             frames = self._load_video_frames(sample["video_path"], self.fps)

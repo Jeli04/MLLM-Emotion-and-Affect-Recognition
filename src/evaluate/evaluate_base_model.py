@@ -1,8 +1,10 @@
 import argparse
+import csv
 import json
 import logging
 import os
 import warnings
+from pathlib import Path
 
 warnings.filterwarnings("ignore")
 logging.getLogger("root").setLevel(logging.ERROR)
@@ -22,18 +24,43 @@ optimum.gptq.constants.BLOCK_PATTERNS.insert(0, "thinker.model.layers")
 
 from src.meld_dataset import RawMELDDataset, EMOTION2ID
 
-ID2EMOTION = {v: k for k, v in EMOTION2ID.items()}
-VALID_EMOTIONS = set(EMOTION2ID.keys())
-
-SYSTEM_PROMPT = (
+MELD_VALID_EMOTIONS = set(EMOTION2ID.keys())
+MELD_SYSTEM_PROMPT = (
     "Your job as a helpful assistant is to detect what emotion is being expressed "
     "from the inputs. Output only one word. Here are the options: "
     "anger, disgust, fear, joy, neutral, sadness, surprise."
 )
+IEMOCAP_EMOTIONS = (
+    "angry",
+    "disgusted",
+    "excited",
+    "fearful",
+    "frustrated",
+    "happy",
+    "neutral",
+    "other",
+    "sad",
+    "surprised",
+)
+IEMOCAP_VALID_EMOTIONS = set(IEMOCAP_EMOTIONS)
+IEMOCAP_SYSTEM_PROMPT = (
+    "Your job as a helpful assistant is to detect what emotion is being expressed "
+    "from the inputs. Output only one word. Here are the options: "
+    + ", ".join(IEMOCAP_EMOTIONS)
+    + "."
+)
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Evaluate Qwen2.5-Omni on MELD emotion recognition")
+    parser = argparse.ArgumentParser(
+        description="Evaluate Qwen2.5-Omni on MELD/IEMOCAP emotion recognition"
+    )
+    parser.add_argument(
+        "--dataset",
+        choices=["meld", "iemocap"],
+        default="meld",
+        help="Dataset backend (default: meld)",
+    )
     parser.add_argument("--modalities", nargs="+", default=["text"],
                         choices=["text", "audio", "video"],
                         help="Which modalities to include in the input (default: text)")
@@ -43,10 +70,90 @@ def parse_args():
                         help="Path to MELD.Raw directory")
     parser.add_argument("--model_path", default="./ckpts/Qwen2.5-Omni-7B-GPTQ-Int4",
                         help="Path to the model")
+    parser.add_argument(
+        "--manifest",
+        default=None,
+        help="Path to iemocap_utterance_labels.csv (required for --dataset iemocap)",
+    )
+    parser.add_argument(
+        "--iemocap_sessions",
+        nargs="*",
+        default=None,
+        help="Optional Session1 Session2 ... filter for iemocap",
+    )
+    parser.add_argument(
+        "--max_samples",
+        type=int,
+        default=None,
+        help="Cap number of IEMOCAP utterances (for smoke tests)",
+    )
     return parser.parse_args()
 
 
-def build_messages(sample, modalities):
+def _resolve_iemocap_media_path(raw_path: str, iemocap_root: Path) -> str:
+    p = (raw_path or "").strip()
+    if not p:
+        return ""
+    path = Path(p)
+    if path.is_file():
+        return str(path.resolve())
+    if not path.is_absolute():
+        cand = iemocap_root / path
+        if cand.is_file():
+            return str(cand.resolve())
+    if path.is_absolute():
+        parts = path.parts
+        for i, part in enumerate(parts):
+            if part == "IEMOCAP_full_release" and i + 1 < len(parts):
+                cand = iemocap_root / Path(*parts[i + 1 :])
+                if cand.is_file():
+                    return str(cand.resolve())
+                break
+    return p
+
+
+def load_iemocap_manifest(manifest_path, split=None, sessions=None, max_samples=None):
+    manifest = Path(manifest_path)
+    if not manifest.is_file():
+        raise FileNotFoundError(f"Manifest not found: {manifest}")
+    iemocap_root = manifest.resolve().parent.parent
+    rows = []
+    with manifest.open(newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        fieldnames = reader.fieldnames or []
+        has_split_col = "split" in fieldnames
+        for row in reader:
+            emo = (row.get("emotion") or "").strip().lower()
+            if not emo or emo == "no_agreement" or emo not in IEMOCAP_VALID_EMOTIONS:
+                continue
+            if sessions:
+                sess = (row.get("session") or "").strip()
+                if sess not in sessions:
+                    continue
+            if split is not None and has_split_col:
+                if (row.get("split") or "").strip() != split:
+                    continue
+            rows.append(
+                {
+                    "text": (row.get("text") or "").strip(),
+                    "emotion": emo,
+                    "dialogue_id": (row.get("recording_id") or "").strip(),
+                    "utterance_id": (row.get("utterance_id") or "").strip(),
+                    "session": (row.get("session") or "").strip(),
+                    "video_path": _resolve_iemocap_media_path(
+                        row.get("video_path") or "", iemocap_root
+                    ),
+                    "audio_path": _resolve_iemocap_media_path(
+                        row.get("wav_path") or "", iemocap_root
+                    ),
+                }
+            )
+            if max_samples is not None and len(rows) >= max_samples:
+                break
+    return rows
+
+
+def build_messages(sample, modalities, system_prompt):
     """Build chat messages based on enabled modalities.
 
     When video is enabled, audio is extracted from the video via
@@ -61,12 +168,13 @@ def build_messages(sample, modalities):
         elif mod == "video":
             user_content.append({"type": "video", "video": sample["video_path"]})
         elif mod == "audio" and not has_video:
-            user_content.append({"type": "audio", "audio": sample["video_path"]})
+            audio_source = sample.get("audio_path") or sample["video_path"]
+            user_content.append({"type": "audio", "audio": audio_source})
 
     messages = [
         {
             "role": "system",
-            "content": [{"type": "text", "text": SYSTEM_PROMPT}],
+            "content": [{"type": "text", "text": system_prompt}],
         },
         {
             "role": "user",
@@ -78,9 +186,25 @@ def build_messages(sample, modalities):
 
 def main():
     args = parse_args()
-    print(f"Evaluating on split='{args.split}' with modalities={args.modalities}")
+    print(
+        f"Evaluating dataset='{args.dataset}' split='{args.split}' with modalities={args.modalities}"
+    )
 
-    dataset = RawMELDDataset(args.data_root, split=args.split, load_audio=False)
+    if args.dataset == "meld":
+        dataset = RawMELDDataset(args.data_root, split=args.split, load_audio=False)
+        valid_emotions = MELD_VALID_EMOTIONS
+        system_prompt = MELD_SYSTEM_PROMPT
+    else:
+        if not args.manifest:
+            raise SystemExit("--manifest is required when --dataset iemocap")
+        dataset = load_iemocap_manifest(
+            args.manifest,
+            split=args.split,
+            sessions=args.iemocap_sessions,
+            max_samples=args.max_samples,
+        )
+        valid_emotions = IEMOCAP_VALID_EMOTIONS
+        system_prompt = IEMOCAP_SYSTEM_PROMPT
 
     # Load model
     processor = Qwen2_5OmniProcessor.from_pretrained(args.model_path)
@@ -97,10 +221,9 @@ def main():
 
     for i, sample in enumerate(tqdm(dataset, desc="Evaluating")):
         gt_emotion = sample["emotion"]
-        messages = build_messages(sample, args.modalities)
+        messages = build_messages(sample, args.modalities, system_prompt)
 
         try:
-            use_audio = "video" in args.modalities or "audio" in args.modalities
             inputs = processor.apply_chat_template(
                 messages,
                 tokenize=True,
@@ -112,7 +235,10 @@ def main():
                 return_dict=True,
                 return_tensors="pt",
             )
-            inputs = {k: v.to(model.device) for k, v in inputs.items()}
+            inputs = {
+                k: v.to(model.device) if isinstance(v, torch.Tensor) else v
+                for k, v in inputs.items()
+            }
 
             text_ids = model.generate(**inputs, max_new_tokens=128, return_audio=False)
 
@@ -128,8 +254,8 @@ def main():
             skipped_samples.append((i, str(e), gt_emotion))
             per_sample_results.append({
                 "sample_index": i,
-                "dialogue_id": sample["dialogue_id"],
-                "utterance_id": sample["utterance_id"],
+                "dialogue_id": sample.get("dialogue_id"),
+                "utterance_id": sample.get("utterance_id"),
                 "text": sample["text"],
                 "ground_truth": gt_emotion,
                 "prediction": None,
@@ -144,12 +270,12 @@ def main():
 
         pred = output_text[0].strip().lower()
         raw_output = output_text[0].strip()
-        is_valid = pred in VALID_EMOTIONS
+        is_valid = pred in valid_emotions
 
         per_sample_results.append({
             "sample_index": i,
-            "dialogue_id": sample["dialogue_id"],
-            "utterance_id": sample["utterance_id"],
+            "dialogue_id": sample.get("dialogue_id"),
+            "utterance_id": sample.get("utterance_id"),
             "text": sample["text"],
             "ground_truth": gt_emotion,
             "prediction": pred,
@@ -180,7 +306,7 @@ def main():
             print(f"  Sample {idx}: model='{model_out}' | gt='{gt}'")
 
     if all_preds:
-        label_names = sorted(VALID_EMOTIONS)
+        label_names = sorted(valid_emotions)
         print("\n--- Classification Report ---")
         print(classification_report(all_labels, all_preds, labels=label_names, zero_division=0))
         acc = accuracy_score(all_labels, all_preds)
@@ -202,10 +328,14 @@ def main():
 
     # Save results to JSON
     modalities_str = "+".join(sorted(args.modalities))
-    output_filename = f"results_{args.split}_{modalities_str}.json"
+    if args.dataset == "meld":
+        output_filename = f"results_{args.split}_{modalities_str}.json"
+    else:
+        output_filename = f"results_iemocap_{args.split}_{modalities_str}.json"
     output_path = os.path.join("results", output_filename)
 
     results_json = {
+        "dataset": args.dataset,
         "split": args.split,
         "modalities": args.modalities,
         "total_samples": len(dataset),
@@ -214,13 +344,13 @@ def main():
         "skipped_samples": len(skipped_samples),
         "accuracy": accuracy_score(all_labels, all_preds) if all_preds else None,
         "auroc_macro_ovr": roc_auc_score(
-            label_binarize(all_labels, classes=sorted(VALID_EMOTIONS)),
-            label_binarize(all_preds, classes=sorted(VALID_EMOTIONS)),
+            label_binarize(all_labels, classes=sorted(valid_emotions)),
+            label_binarize(all_preds, classes=sorted(valid_emotions)),
             average="macro",
         ) if all_preds else None,
         "auprc_macro_ovr": average_precision_score(
-            label_binarize(all_labels, classes=sorted(VALID_EMOTIONS)),
-            label_binarize(all_preds, classes=sorted(VALID_EMOTIONS)),
+            label_binarize(all_labels, classes=sorted(valid_emotions)),
+            label_binarize(all_preds, classes=sorted(valid_emotions)),
             average="macro",
         ) if all_preds else None,
         "mcc": matthews_corrcoef(all_labels, all_preds) if all_preds else None,

@@ -105,7 +105,13 @@ def parse_args():
     parser.add_argument("--lora_alpha", type=int, default=32)
     parser.add_argument("--lora_dropout", type=float, default=0.05)
     parser.add_argument("--logging_steps", type=int, default=10)
+    parser.add_argument("--num_workers", type=int, default=4,
+                        help="DataLoader worker processes (parallel video/audio decoding)")
     parser.add_argument("--save_steps", type=int, default=200)
+    parser.add_argument("--resume_from_checkpoint", type=str, default=None,
+                        help="Path to a checkpoint dir to resume from (e.g. "
+                             "./ckpts/finetuned_distill/checkpoint-1800). "
+                             "Pass 'True' to auto-pick the latest in output_dir.")
     parser.add_argument("--corrupt", action="store_true", default=True,
                         help="Apply noise/corruption to raw inputs")
     parser.add_argument("--no_corrupt", dest="corrupt", action="store_false")
@@ -172,6 +178,10 @@ def main():
     del model
     torch.cuda.empty_cache()
 
+    # Required when grad checkpointing with a frozen base: forces the embedding
+    # output to require_grad so the autograd graph reaches LoRA adapters.
+    if hasattr(thinker, "enable_input_require_grads"):
+        thinker.enable_input_require_grads()
     thinker.gradient_checkpointing_enable()
     thinker.print_trainable_parameters()
 
@@ -211,7 +221,7 @@ def main():
         report_to="wandb" if args.wandb else "none",
         run_name=run_name,
         remove_unused_columns=False,
-        dataloader_num_workers=0,
+        dataloader_num_workers=args.num_workers,
     )
 
     trainer = StudentTeacherTrainer(
@@ -223,7 +233,7 @@ def main():
         lambda_kl=args.lambda_kl,
     )
 
-    trainer.train()
+    trainer.train(resume_from_checkpoint=args.resume_from_checkpoint)
 
     adapter_dir = os.path.join(args.output_dir, "lora_adapter")
     thinker.save_pretrained(adapter_dir)

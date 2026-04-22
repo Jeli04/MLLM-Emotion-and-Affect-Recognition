@@ -3,3 +3,4 @@ slurm_logs/
 test*.py
 __pycache__/
 wandb/
+ckpts/

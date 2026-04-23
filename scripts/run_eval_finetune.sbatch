@@ -20,4 +20,7 @@ cd $SLURM_SUBMIT_DIR
 
 source ./.venv-qwen/bin/activate
 module load ffmpeg
-uv run python -m src.evaluate.py "$@"
+uv run python -m src.evaluate.evaluate_base_model_corruption \
+    --adapter_path ./ckpts/finetuned_base/lora_adapter \
+    --modalities text audio video \
+    "$@"

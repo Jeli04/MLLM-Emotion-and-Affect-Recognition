@@ -303,7 +303,7 @@ class CorruptedMELDDataset(Dataset):
             )
         else:
             rendered_text = self.processor.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True,
+                messages[:-1], tokenize=False, add_generation_prompt=True,
             )
             prompt_rendered = None
 

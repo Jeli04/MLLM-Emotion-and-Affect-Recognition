@@ -3,6 +3,7 @@ import logging
 import os
 from functools import partial
 
+import numpy as np
 import torch
 from transformers import (
     Qwen2_5OmniForConditionalGeneration,
@@ -12,6 +13,7 @@ from transformers import (
 )
 from peft import LoraConfig, get_peft_model, TaskType
 
+# prevents warning message from being displayed
 logging.getLogger().addFilter(
     lambda r: "System prompt modified" not in r.getMessage()
 )
@@ -20,7 +22,7 @@ logging.getLogger().addFilter(
 import optimum.gptq.constants
 optimum.gptq.constants.BLOCK_PATTERNS.insert(0, "thinker.model.layers")
 
-from src.meld_dataset import CorruptedMELDDataset, collate_fn
+from src.meld_dataset import CorruptedMELDDataset, collate_fn, EMOTION2ID
 
 
 def parse_args():
@@ -62,6 +64,58 @@ def parse_args():
     return parser.parse_args()
 
 
+def preprocess_logits_for_metrics(logits, labels):
+    # Reduce [batch, seq_len, vocab_size] → [batch, seq_len] before Trainer
+    # stores them, otherwise the full logit tensor OOMs on large sequences.
+    return logits.argmax(dim=-1)
+
+
+def make_compute_metrics(emotion_first_token_ids):
+    """Return a compute_metrics closure over the per-emotion first-token IDs.
+
+    emotion_first_token_ids: dict mapping emotion name → token ID of its first
+    subword (e.g. {"neutral": 19282, ...}), built from the processor tokenizer.
+    """
+    id2emotion = {v: k for k, v in emotion_first_token_ids.items()}
+
+    def compute_metrics(eval_pred):
+        pred_tokens, label_ids = eval_pred
+        # pred_tokens: [n, seq_len] — argmax over vocab at each position
+        # label_ids:   [n, seq_len] — -100 for prompt/padding, real token elsewhere
+
+        per_class_correct = {e: 0 for e in emotion_first_token_ids}
+        per_class_total   = {e: 0 for e in emotion_first_token_ids}
+
+        for pred_seq, label_seq in zip(pred_tokens, label_ids):
+            resp = np.where(label_seq != -100)[0]
+            if len(resp) == 0 or resp[0] == 0:
+                continue
+            first_pos = int(resp[0])
+            true_tok  = int(label_seq[first_pos])
+            # logits[j] predicts the token at position j+1, so the prediction
+            # for the first response token lives at position first_pos - 1.
+            pred_tok  = int(pred_seq[first_pos - 1])
+
+            true_emotion = id2emotion.get(true_tok)
+            if true_emotion is None:
+                continue
+            per_class_total[true_emotion] += 1
+            if pred_tok == true_tok:
+                per_class_correct[true_emotion] += 1
+
+        total   = sum(per_class_total.values())
+        correct = sum(per_class_correct.values())
+        metrics = {"accuracy": correct / total if total > 0 else 0.0}
+        for emotion in emotion_first_token_ids:
+            n = per_class_total[emotion]
+            metrics[f"acc_{emotion}"] = (
+                per_class_correct[emotion] / n if n > 0 else 0.0
+            )
+        return metrics
+
+    return compute_metrics
+
+
 def main():
     args = parse_args()
     print(f"Finetuning with modalities={args.modalities}, corrupt={args.corrupt}, wandb={args.wandb}")
@@ -73,6 +127,15 @@ def main():
             os.environ["WANDB_ENTITY"] = args.wandb_entity
 
     processor = Qwen2_5OmniProcessor.from_pretrained(args.model_path)
+
+    # Build emotion -> first-subword-token-ID map for compute_metrics.
+    emotion_first_token_ids = {
+        emotion: processor.tokenizer(
+            emotion, add_special_tokens=False
+        )["input_ids"][0]
+        for emotion in EMOTION2ID
+    }
+    print("Emotion first token IDs:", emotion_first_token_ids)
     model = Qwen2_5OmniForConditionalGeneration.from_pretrained(
         args.model_path,
         device_map="auto",
@@ -146,6 +209,8 @@ def main():
         train_dataset=train_dataset,
         eval_dataset=val_dataset,
         data_collator=data_collator,
+        compute_metrics=make_compute_metrics(emotion_first_token_ids),
+        preprocess_logits_for_metrics=preprocess_logits_for_metrics,
     )
 
     trainer.train()

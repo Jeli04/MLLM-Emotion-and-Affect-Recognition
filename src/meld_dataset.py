@@ -242,11 +242,12 @@ class CorruptedMELDDataset(Dataset):
     Loads raw video frames, audio waveforms, and text, applies corruption,
     then runs the processor to produce model-ready inputs.
 
-    When `distill=True` and len(modalities) >= 2, __getitem__ returns a paired
-    {"full": ..., "mask": ...} dict: the full item uses all modalities, the
-    mask item uses a random non-empty strict subset. Media is loaded and
-    corrupted once and shared across both passes, so the only difference
-    between teacher and student inputs is which modalities are present.
+    When `distill=True`, __getitem__ returns a paired {"full": ..., "mask": ...}
+    dict. The full item uses all modalities; the mask item uses either all
+    modalities or a random non-empty strict subset, depending on
+    `modality_mask`. By default corruption is shared across both passes; with
+    `clean_teacher=True`, the full branch stays uncorrupted while the mask
+    branch follows the corruption setting.
     """
 
     def __init__(
@@ -264,6 +265,8 @@ class CorruptedMELDDataset(Dataset):
         video_noise_level=0.05,
         for_training=False,
         distill=False,
+        modality_mask=True,
+        clean_teacher=False,
     ):
         self.raw_dataset = RawMELDDataset(
             meld_root, split=split, load_audio=False, audio_sr=audio_sr,
@@ -279,6 +282,8 @@ class CorruptedMELDDataset(Dataset):
         self.video_noise_level = video_noise_level
         self.for_training = for_training
         self.distill = distill
+        self.modality_mask = modality_mask
+        self.clean_teacher = clean_teacher
 
     def __len__(self):
         return len(self.raw_dataset)
@@ -342,22 +347,30 @@ class CorruptedMELDDataset(Dataset):
 
     def _sample_kept_modalities(self):
         mods = list(self.modalities)
-        num_to_mask = random.randint(1, len(mods))
-        dropped = set(random.sample(mods, num_to_mask))
-        return [m for m in mods if m not in dropped]
+        if len(mods) <= 1:
+            return mods
+        keep_count = random.randint(1, len(mods) - 1)
+        kept = set(random.sample(mods, keep_count))
+        return [m for m in mods if m in kept]
 
-    def __getitem__(self, idx):
-        sample = self.raw_dataset[idx]
-
-        # Corrupt-once: applied before the split so teacher and student see
-        # identical media; only modality presence differs between the two.
-        text = sample["text"]
-        if self.corrupt and "text" in self.modalities:
+    def _corrupt_media(self, text, frames, waveform):
+        if "text" in self.modalities:
             text = corrupt_text(
                 text,
                 char_swap_prob=self.text_char_swap_prob,
                 word_drop_prob=self.text_word_drop_prob,
             )
+        if frames is not None:
+            noise = np.random.randn(*frames.shape).astype(np.float32) * self.video_noise_level * 255
+            frames = np.clip(frames.astype(np.float32) + noise, 0, 255).astype(np.uint8)
+        if waveform is not None:
+            waveform = corrupt_audio(waveform, noise_level=self.audio_noise_level)
+        return text, frames, waveform
+
+    def __getitem__(self, idx):
+        sample = self.raw_dataset[idx]
+
+        text = sample["text"]
 
         # If a file is missing or unreadable, fall back to a zero-filled tensor
         # so the sample still contributes (with padding) rather than crashing.
@@ -369,25 +382,37 @@ class CorruptedMELDDataset(Dataset):
             except Exception:
                 # 2 black frames (minimum for temporal_patch_size=2), 224×224 RGB
                 frames = np.zeros((2, 224, 224, 3), dtype=np.uint8)
-            if self.corrupt:
-                noise = np.random.randn(*frames.shape).astype(np.float32) * self.video_noise_level * 255
-                frames = np.clip(frames.astype(np.float32) + noise, 0, 255).astype(np.uint8)
         if "audio" in self.modalities or "video" in self.modalities:
             try:
                 waveform, _ = load_audio_from_video(sample["video_path"], target_sr=self.audio_sr)
             except Exception:
                 # 1 second of silence at the target sample rate
                 waveform = np.zeros(self.audio_sr, dtype=np.float32)
-            if self.corrupt:
-                waveform = corrupt_audio(waveform, noise_level=self.audio_noise_level)
 
         if self.distill:
-            full_item = self._process(sample, text, frames, waveform, self.modalities)
+            full_text, full_frames, full_waveform = text, frames, waveform
+            mask_text, mask_frames, mask_waveform = text, frames, waveform
+            if self.corrupt:
+                if self.clean_teacher:
+                    mask_text, mask_frames, mask_waveform = self._corrupt_media(
+                        text, frames, waveform,
+                    )
+                else:
+                    full_text, full_frames, full_waveform = self._corrupt_media(
+                        text, frames, waveform,
+                    )
+                    mask_text, mask_frames, mask_waveform = (
+                        full_text, full_frames, full_waveform,
+                    )
+
+            full_item = self._process(
+                sample, full_text, full_frames, full_waveform, self.modalities,
+            )
             full_item["emotion"] = sample["emotion"]
             full_item["label"] = sample["label"]
 
-            kept = self._sample_kept_modalities()
-            mask_item = self._process(sample, text, frames, waveform, kept)
+            kept = self._sample_kept_modalities() if self.modality_mask else self.modalities
+            mask_item = self._process(sample, mask_text, mask_frames, mask_waveform, kept)
             mask_item["emotion"] = sample["emotion"]
             mask_item["label"] = sample["label"]
 
@@ -398,6 +423,8 @@ class CorruptedMELDDataset(Dataset):
                 "label": sample["label"],
             }
 
+        if self.corrupt:
+            text, frames, waveform = self._corrupt_media(text, frames, waveform)
         result = self._process(sample, text, frames, waveform, self.modalities)
         result["emotion"] = sample["emotion"]
         result["label"] = sample["label"]

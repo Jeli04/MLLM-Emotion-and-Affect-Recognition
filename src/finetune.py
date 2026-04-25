@@ -1,6 +1,7 @@
 import argparse
 import logging
 import os
+from contextlib import nullcontext
 from functools import partial
 
 import torch
@@ -24,15 +25,70 @@ optimum.gptq.constants.BLOCK_PATTERNS.insert(0, "thinker.model.layers")
 from src.meld_dataset import CorruptedMELDDataset, collate_fn
 
 
+def set_adapter_trainability(model, adapter_name, trainable):
+    marker = f".{adapter_name}."
+    for name, param in model.named_parameters():
+        if marker in name:
+            param.requires_grad = trainable
+
+
 class StudentTeacherTrainer(Trainer):
-    """Trainer that applies CE + λ·KL(sg(p_full) || p_mask) when inputs are
-    paired {"full": ..., "mask": ...} dicts. Falls back to the default CE path
-    for unpaired inputs, so non-distill runs are unaffected.
+    """Trainer for paired full/masked inputs.
+
+    Distill mode optimizes weighted CE on both full and masked student inputs,
+    plus lambda*KL(sg(p_teacher_full) || p_student_mask). It falls back to the
+    default CE path for unpaired inputs, so non-distill runs are unaffected.
     """
 
-    def __init__(self, *args, lambda_kl=1.0, **kwargs):
+    def __init__(
+        self,
+        *args,
+        lambda_kl=0.1,
+        distill_temperature=2.0,
+        full_ce_weight=0.5,
+        mask_ce_weight=0.5,
+        student_adapter_name="default",
+        teacher_adapter_name=None,
+        base_teacher=False,
+        **kwargs,
+    ):
         super().__init__(*args, **kwargs)
         self.lambda_kl = lambda_kl
+        if distill_temperature <= 0:
+            raise ValueError("distill_temperature must be > 0")
+        if full_ce_weight < 0 or mask_ce_weight < 0:
+            raise ValueError("CE weights must be non-negative")
+        self.distill_temperature = distill_temperature
+        self.full_ce_weight = full_ce_weight
+        self.mask_ce_weight = mask_ce_weight
+        self.student_adapter_name = student_adapter_name
+        self.teacher_adapter_name = teacher_adapter_name
+        self.base_teacher = base_teacher
+
+    def _set_adapter(self, model, adapter_name, trainable=None):
+        if adapter_name is not None and hasattr(model, "set_adapter"):
+            model.set_adapter(adapter_name)
+            if trainable is not None:
+                set_adapter_trainability(model, adapter_name, trainable)
+
+    def _teacher_forward(self, model, full_inputs_no_labels, full_student_out):
+        if self.teacher_adapter_name is None and not self.base_teacher:
+            return full_student_out
+
+        was_training = model.training
+        teacher_context = nullcontext()
+        if self.teacher_adapter_name is not None:
+            self._set_adapter(model, self.teacher_adapter_name, trainable=False)
+        else:
+            teacher_context = model.disable_adapter()
+
+        model.eval()
+        with torch.no_grad(), teacher_context:
+            teacher_out = model(**full_inputs_no_labels)
+        if was_training:
+            model.train()
+        self._set_adapter(model, self.student_adapter_name, trainable=True)
+        return teacher_out
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         if "full" not in inputs or "mask" not in inputs:
@@ -42,37 +98,75 @@ class StudentTeacherTrainer(Trainer):
                 num_items_in_batch=num_items_in_batch,
             )
 
-        full_inputs = {k: v for k, v in inputs["full"].items() if k != "labels"}
+        full_inputs = inputs["full"]
+        full_inputs_no_labels = {k: v for k, v in full_inputs.items() if k != "labels"}
         mask_inputs = inputs["mask"]
 
-        with torch.no_grad():
-            full_out = model(**full_inputs)
-
+        self._set_adapter(model, self.student_adapter_name, trainable=True)
+        needs_full_student = (
+            self.full_ce_weight > 0
+            or (self.teacher_adapter_name is None and not self.base_teacher)
+        )
+        full_student_out = model(**full_inputs) if needs_full_student else None
         mask_out = model(**mask_inputs)
-        ce_loss = mask_out.loss
+        mask_ce_loss = mask_out.loss
+        full_ce_loss = (
+            full_student_out.loss
+            if full_student_out is not None
+            else torch.zeros((), device=mask_ce_loss.device, dtype=mask_ce_loss.dtype)
+        )
+        ce_loss = self.full_ce_weight * full_ce_loss + self.mask_ce_weight * mask_ce_loss
 
-        def response_logits(logits, labels):
+        teacher_out = self._teacher_forward(model, full_inputs_no_labels, full_student_out)
+        teacher_logits = teacher_out.logits.detach()
+
+        def response_logits_and_labels(logits, labels):
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
             keep = shift_labels != -100
-            return shift_logits[keep]
+            return shift_logits[keep], shift_labels[keep]
 
-        student_resp = response_logits(mask_out.logits, mask_inputs["labels"])
-        teacher_resp = response_logits(full_out.logits, inputs["full"]["labels"]).detach()
+        student_resp, _ = response_logits_and_labels(mask_out.logits, mask_inputs["labels"])
+        teacher_resp, teacher_labels = response_logits_and_labels(
+            teacher_logits, full_inputs["labels"],
+        )
+        teacher_labels = teacher_labels.detach()
+
+        if teacher_resp.numel() == 0:
+            teacher_nll = torch.zeros((), device=ce_loss.device)
+            teacher_token_acc = torch.zeros((), device=ce_loss.device)
+        else:
+            teacher_nll = F.cross_entropy(teacher_resp.float(), teacher_labels)
+            teacher_token_acc = (
+                teacher_resp.argmax(dim=-1).eq(teacher_labels).float().mean()
+            )
 
         if student_resp.numel() == 0 or student_resp.shape != teacher_resp.shape:
             loss = ce_loss
             kl_val = torch.zeros((), device=ce_loss.device)
+            kl_raw_val = kl_val
+            kl_weighted_val = kl_val
         else:
             # KL in fp32 for numerical stability under fp16 training.
-            log_p_mask = F.log_softmax(student_resp.float(), dim=-1)
-            p_full = F.softmax(teacher_resp.float(), dim=-1)
-            kl = F.kl_div(log_p_mask, p_full, reduction="batchmean")
-            loss = ce_loss + self.lambda_kl * kl
+            t = self.distill_temperature
+            log_p_mask = F.log_softmax(student_resp.float() / t, dim=-1)
+            p_full = F.softmax(teacher_resp.float() / t, dim=-1)
+            kl_raw = F.kl_div(log_p_mask, p_full, reduction="batchmean")
+            kl = kl_raw * (t ** 2)
+            kl_weighted = self.lambda_kl * kl
+            loss = ce_loss + kl_weighted
             kl_val = kl.detach()
+            kl_raw_val = kl_raw.detach()
+            kl_weighted_val = kl_weighted.detach()
 
         self._last_ce = ce_loss.detach()
+        self._last_full_ce = full_ce_loss.detach()
+        self._last_mask_ce = mask_ce_loss.detach()
         self._last_kl = kl_val
+        self._last_kl_raw = kl_raw_val
+        self._last_kl_weighted = kl_weighted_val
+        self._last_teacher_nll = teacher_nll.detach()
+        self._last_teacher_token_acc = teacher_token_acc.detach()
 
         return (loss, mask_out) if return_outputs else loss
 
@@ -81,7 +175,13 @@ class StudentTeacherTrainer(Trainer):
             logs = {
                 **logs,
                 "loss/ce": float(self._last_ce),
+                "loss/full_ce": float(self._last_full_ce),
+                "loss/mask_ce": float(self._last_mask_ce),
                 "loss/kl": float(self._last_kl),
+                "loss/kl_raw": float(self._last_kl_raw),
+                "loss/kl_weighted": float(self._last_kl_weighted),
+                "teacher/nll": float(self._last_teacher_nll),
+                "teacher/token_acc": float(self._last_teacher_token_acc),
             }
         return super().log(logs, *args, **kwargs)
 
@@ -115,13 +215,35 @@ def parse_args():
     parser.add_argument("--corrupt", action="store_true", default=True,
                         help="Apply noise/corruption to raw inputs")
     parser.add_argument("--no_corrupt", dest="corrupt", action="store_false")
+    parser.add_argument("--modality_mask", action="store_true", default=True,
+                        help="Randomly drop modalities from the student branch in distill mode")
+    parser.add_argument("--no_modality_mask", dest="modality_mask", action="store_false",
+                        help="Disable modality dropout; corruption can still be applied")
+    parser.add_argument("--clean_teacher", action="store_true", default=False,
+                        help="In distill mode, keep the full/teacher branch uncorrupted "
+                             "while the mask/student branch follows --corrupt")
 
     parser.add_argument("--distill", action="store_true", default=False,
                         help="Enable student-teacher distillation: two forward passes "
                              "per sample (full modalities vs. random masked subset), "
-                             "loss = CE(student) + lambda_kl * KL(sg(p_full) || p_mask).")
-    parser.add_argument("--lambda_kl", type=float, default=1.0,
+                             "loss = weighted CE(full/mask student) + "
+                             "lambda_kl * KL(sg(p_teacher_full) || p_student_mask).")
+    parser.add_argument("--lambda_kl", type=float, default=0.1,
                         help="Weight on the KL consistency term when --distill is set")
+    parser.add_argument("--distill_temperature", type=float, default=2.0,
+                        help="Temperature for distillation soft targets. The KL term "
+                             "is multiplied by temperature^2.")
+    parser.add_argument("--full_ce_weight", type=float, default=0.5,
+                        help="Weight for full-modality student CE in distill mode")
+    parser.add_argument("--mask_ce_weight", type=float, default=0.5,
+                        help="Weight for masked-modality student CE in distill mode")
+    parser.add_argument("--teacher_adapter_path", type=str, default=None,
+                        help="Optional LoRA adapter path for a frozen full-modality "
+                             "teacher. If omitted, the full-modality student pass is "
+                             "used as an online adapter-enabled teacher.")
+    parser.add_argument("--base_teacher", action="store_true", default=False,
+                        help="Use the frozen base model with adapters disabled as the "
+                             "teacher. Ignored when --teacher_adapter_path is set.")
 
     # W&B args
     parser.add_argument("--wandb", dest="wandb", action="store_true", default=True,
@@ -142,7 +264,12 @@ def main():
     args = parse_args()
     print(
         f"Finetuning with modalities={args.modalities}, corrupt={args.corrupt}, "
-        f"distill={args.distill}, lambda_kl={args.lambda_kl}, wandb={args.wandb}"
+        f"modality_mask={args.modality_mask}, clean_teacher={args.clean_teacher}, "
+        f"distill={args.distill}, lambda_kl={args.lambda_kl}, "
+        f"distill_temperature={args.distill_temperature}, "
+        f"full_ce_weight={args.full_ce_weight}, mask_ce_weight={args.mask_ce_weight}, "
+        f"teacher_adapter_path={args.teacher_adapter_path}, base_teacher={args.base_teacher}, "
+        f"wandb={args.wandb}"
     )
 
     # Set W&B env vars before Trainer is created
@@ -167,6 +294,16 @@ def main():
     )
 
     thinker = get_peft_model(model.thinker, lora_config)
+    teacher_adapter_name = None
+    if args.teacher_adapter_path is not None:
+        teacher_adapter_name = "teacher"
+        thinker.load_adapter(
+            args.teacher_adapter_path,
+            adapter_name=teacher_adapter_name,
+            is_trainable=False,
+        )
+        set_adapter_trainability(thinker, teacher_adapter_name, False)
+        thinker.set_adapter("default")
 
     # remove unused speech-generation side
     if hasattr(model, "talker"):
@@ -191,6 +328,8 @@ def main():
         corrupt=args.corrupt,
         for_training=True,
         distill=args.distill,
+        modality_mask=args.modality_mask,
+        clean_teacher=args.clean_teacher,
     )
     train_dataset = CorruptedMELDDataset(args.data_root, split="train", **common)
     val_dataset = CorruptedMELDDataset(args.data_root, split="dev", **common)
@@ -231,6 +370,12 @@ def main():
         eval_dataset=val_dataset,
         data_collator=data_collator,
         lambda_kl=args.lambda_kl,
+        distill_temperature=args.distill_temperature,
+        full_ce_weight=args.full_ce_weight,
+        mask_ce_weight=args.mask_ce_weight,
+        student_adapter_name="default",
+        teacher_adapter_name=teacher_adapter_name,
+        base_teacher=args.base_teacher and teacher_adapter_name is None,
     )
 
     trainer.train(resume_from_checkpoint=args.resume_from_checkpoint)

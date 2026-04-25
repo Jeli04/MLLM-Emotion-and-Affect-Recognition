@@ -83,8 +83,12 @@ class StudentTeacherTrainer(Trainer):
             teacher_context = model.disable_adapter()
 
         model.eval()
+        # Bypass accelerate's ConvertOutputsToFp32 wrapper on model.forward —
+        # it would cast the full [B, T, V] logits to fp32, costing ~8 GB
+        # transient memory we don't need (KL/CE only cast the response slice).
+        inner_forward = getattr(model.forward, "model_forward", model.forward)
         with torch.no_grad(), teacher_context:
-            teacher_out = model(**full_inputs_no_labels)
+            teacher_out = inner_forward(**full_inputs_no_labels)
         if was_training:
             model.train()
         self._set_adapter(model, self.student_adapter_name, trainable=True)

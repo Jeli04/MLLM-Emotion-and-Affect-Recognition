@@ -214,6 +214,7 @@ def main():
     model = Qwen2_5OmniForConditionalGeneration.from_pretrained(
         args.model_path,
         device_map="auto",
+        enable_audio_output=False,
     )
     if args.adapter_path is not None:
         print(f"Loading LoRA adapter from {args.adapter_path}...")

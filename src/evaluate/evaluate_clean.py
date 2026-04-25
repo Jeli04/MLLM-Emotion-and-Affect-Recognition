@@ -10,6 +10,7 @@ warnings.filterwarnings("ignore")
 logging.getLogger("root").setLevel(logging.ERROR)
 
 from transformers import Qwen2_5OmniForConditionalGeneration, Qwen2_5OmniProcessor
+from peft import PeftModel
 import torch
 from tqdm import tqdm
 from sklearn.metrics import (
@@ -70,6 +71,8 @@ def parse_args():
                         help="Path to MELD.Raw directory")
     parser.add_argument("--model_path", default="./ckpts/Qwen2.5-Omni-7B-GPTQ-Int4",
                         help="Path to the model")
+    parser.add_argument("--adapter_path", default=None,
+                        help="Path to a LoRA adapter checkpoint to load on top of the base model")
     parser.add_argument(
         "--manifest",
         default=None,
@@ -212,6 +215,11 @@ def main():
         args.model_path,
         device_map="auto",
     )
+    if args.adapter_path is not None:
+        print(f"Loading LoRA adapter from {args.adapter_path}...")
+        model.thinker = PeftModel.from_pretrained(model.thinker, args.adapter_path)
+
+    model.eval()
 
     all_preds = []
     all_labels = []
@@ -328,16 +336,18 @@ def main():
 
     # Save results to JSON
     modalities_str = "+".join(sorted(args.modalities))
+    model_str = "finetuned" if args.adapter_path else "base"
     if args.dataset == "meld":
-        output_filename = f"results_{args.split}_{modalities_str}.json"
+        output_filename = f"results_{args.split}_{modalities_str}_{model_str}.json"
     else:
-        output_filename = f"results_iemocap_{args.split}_{modalities_str}.json"
+        output_filename = f"results_iemocap_{args.split}_{modalities_str}_{model_str}.json"
     output_path = os.path.join("results", output_filename)
 
     results_json = {
         "dataset": args.dataset,
         "split": args.split,
         "modalities": args.modalities,
+        "adapter_path": args.adapter_path,
         "total_samples": len(dataset),
         "valid_predictions": len(all_preds),
         "invalid_predictions": len(invalid_predictions),

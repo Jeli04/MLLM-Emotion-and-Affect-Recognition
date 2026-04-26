@@ -20,7 +20,16 @@ from sklearn.preprocessing import label_binarize
 import optimum.gptq.constants
 optimum.gptq.constants.BLOCK_PATTERNS.insert(0, "thinker.model.layers")
 
-from src.meld_dataset import RawMELDDataset, EMOTION2ID
+import numpy as np
+
+from src.meld_dataset import (
+    RawMELDDataset,
+    EMOTION2ID,
+    load_video_frames,
+    load_audio_from_video,
+    corrupt_text,
+    corrupt_audio,
+)
 
 ID2EMOTION = {v: k for k, v in EMOTION2ID.items()}
 VALID_EMOTIONS = set(EMOTION2ID.keys())
@@ -42,7 +51,18 @@ def parse_args():
     parser.add_argument("--data_root", default="/project2/robinjia_875/lijc/data/MELD.Raw",
                         help="Path to MELD.Raw directory")
     parser.add_argument("--model_path", default="./ckpts/Qwen2.5-Omni-7B-GPTQ-Int4",
-                        help="Path to the model")
+                        help="Path to the base model")
+    parser.add_argument("--adapter_path", default=None,
+                        help="Optional LoRA adapter dir (e.g. "
+                             "./ckpts/finetuned_distill/checkpoint-3600). "
+                             "When set, wraps model.thinker with PeftModel before eval.")
+    parser.add_argument("--corrupt", action="store_true", default=False,
+                        help="Apply the same text/audio/video corruption used "
+                             "in training to each eval sample.")
+    parser.add_argument("--text_char_swap_prob", type=float, default=0.1)
+    parser.add_argument("--text_word_drop_prob", type=float, default=0.1)
+    parser.add_argument("--audio_noise_level", type=float, default=0.05)
+    parser.add_argument("--video_noise_level", type=float, default=0.05)
     return parser.parse_args()
 
 
@@ -87,7 +107,17 @@ def main():
     model = Qwen2_5OmniForConditionalGeneration.from_pretrained(
         args.model_path,
         device_map="auto",
+        torch_dtype=torch.float16,
     )
+
+    if args.adapter_path:
+        from peft import PeftModel
+        print(f"Attaching LoRA adapter: {args.adapter_path}")
+        model.thinker = PeftModel.from_pretrained(
+            model.thinker, args.adapter_path, torch_dtype=torch.float16,
+        )
+        model.thinker = model.thinker.to(torch.float16)
+        model.thinker.eval()
 
     all_preds = []
     all_labels = []
@@ -97,24 +127,66 @@ def main():
 
     for i, sample in enumerate(tqdm(dataset, desc="Evaluating")):
         gt_emotion = sample["emotion"]
-        messages = build_messages(sample, args.modalities)
 
         try:
-            use_audio = "video" in args.modalities or "audio" in args.modalities
-            inputs = processor.apply_chat_template(
-                messages,
-                tokenize=True,
-                add_generation_prompt=True,
-                load_audio_from_video=("video" in args.modalities),
-                use_audio_in_video=("video" in args.modalities),
-                fps=1,
-                padding=True,
-                return_dict=True,
-                return_tensors="pt",
-            )
+            if args.corrupt:
+                # Pre-load raw media, corrupt, then render + run the processor
+                # with pre-loaded arrays (mirrors the training corruption path).
+                text = sample["text"]
+                if "text" in args.modalities:
+                    text = corrupt_text(
+                        text,
+                        char_swap_prob=args.text_char_swap_prob,
+                        word_drop_prob=args.text_word_drop_prob,
+                    )
+                frames = None
+                waveform = None
+                if "video" in args.modalities:
+                    try:
+                        frames = load_video_frames(sample["video_path"], fps=1)
+                    except Exception:
+                        frames = np.zeros((2, 224, 224, 3), dtype=np.uint8)
+                    noise = np.random.randn(*frames.shape).astype(np.float32) * args.video_noise_level * 255
+                    frames = np.clip(frames.astype(np.float32) + noise, 0, 255).astype(np.uint8)
+                if "audio" in args.modalities or "video" in args.modalities:
+                    try:
+                        waveform, _ = load_audio_from_video(sample["video_path"], target_sr=16000)
+                    except Exception:
+                        waveform = np.zeros(16000, dtype=np.float32)
+                    waveform = corrupt_audio(waveform, noise_level=args.audio_noise_level)
+
+                messages = build_messages({**sample, "text": text}, args.modalities)
+                rendered_text = processor.apply_chat_template(
+                    messages, tokenize=False, add_generation_prompt=True,
+                )
+                has_video = "video" in args.modalities
+                has_audio = "audio" in args.modalities or has_video
+                inputs = processor(
+                    text=rendered_text,
+                    videos=[frames] if has_video else None,
+                    audio=[waveform] if has_audio else None,
+                    use_audio_in_video=has_video and has_audio,
+                    fps=1,
+                    do_sample_frames=False,
+                    padding=True,
+                    return_tensors="pt",
+                )
+            else:
+                messages = build_messages(sample, args.modalities)
+                inputs = processor.apply_chat_template(
+                    messages,
+                    tokenize=True,
+                    add_generation_prompt=True,
+                    load_audio_from_video=("video" in args.modalities),
+                    use_audio_in_video=("video" in args.modalities),
+                    fps=1,
+                    padding=True,
+                    return_dict=True,
+                    return_tensors="pt",
+                )
             inputs = {k: v.to(model.device) for k, v in inputs.items()}
 
-            text_ids = model.generate(**inputs, max_new_tokens=128, return_audio=False)
+            text_ids = model.generate(**inputs, max_new_tokens=16, return_audio=False)
 
             generated_ids_trimmed = [
                 out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs["input_ids"], text_ids)
@@ -124,7 +196,10 @@ def main():
                 skip_special_tokens=True,
                 clean_up_tokenization_spaces=False,
             )
-        except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
+
+            del inputs, text_ids, generated_ids_trimmed
+            torch.cuda.empty_cache()
+        except (torch.cuda.OutOfMemoryError, RuntimeError, ValueError, OSError) as e:
             skipped_samples.append((i, str(e), gt_emotion))
             per_sample_results.append({
                 "sample_index": i,

@@ -149,10 +149,12 @@ class RawMELDDataset(Dataset):
         return sample
 
 
-def load_video_frames(video_path, fps=1, temporal_patch_size=2):
+def load_video_frames(video_path, fps=1, temporal_patch_size=2, max_frames=16):
     """Decode a video file with decord and sample frames at target fps.
 
     Rounds the frame count to a multiple of temporal_patch_size (2 for Qwen2.5-Omni).
+    Caps total frames at `max_frames` so a single long clip can't blow up VRAM
+    via thousands of vision tokens. Set max_frames=None to disable the cap.
     Returns a [N, H, W, C] uint8 numpy array.
     """
     vr = decord.VideoReader(str(video_path), num_threads=1)
@@ -161,6 +163,10 @@ def load_video_frames(video_path, fps=1, temporal_patch_size=2):
     num_frames = max(1, math.floor(total_frames / video_fps * fps))
     num_frames = max(temporal_patch_size, round(num_frames / temporal_patch_size) * temporal_patch_size)
     num_frames = min(num_frames, total_frames)
+    if max_frames is not None:
+        # Round cap down to a multiple of temporal_patch_size
+        cap = (max_frames // temporal_patch_size) * temporal_patch_size
+        num_frames = min(num_frames, cap)
     indices = np.linspace(0, total_frames - 1, num_frames, dtype=int)
     return vr.get_batch(indices).asnumpy()
 
@@ -239,14 +245,18 @@ def build_messages(sample, modalities):
 class CorruptedMELDDataset(Dataset):
     """MELD dataset with optional corruption applied to raw modality data.
 
-    Loads raw video frames, audio waveforms, and text, applies corruption,
-    then runs the processor to produce model-ready inputs.
+    Loads raw video frames, audio waveforms, and text, then runs the
+    processor to produce model-ready inputs.
 
-    When `distill=True` and len(modalities) >= 2, __getitem__ returns a paired
-    {"full": ..., "mask": ...} dict: the full item uses all modalities, the
-    mask item uses a random non-empty strict subset. Media is loaded and
-    corrupted once and shared across both passes, so the only difference
-    between teacher and student inputs is which modalities are present.
+    When `distill=True`, __getitem__ returns a paired {"full": ..., "mask": ...}
+    dict where:
+      - "full"  = teacher input: CLEAN, uncorrupted media, all modalities
+      - "mask"  = student input: CORRUPTED media (via `corrupt`), all modalities
+    The modalities are the same in both passes; the only difference is that
+    the student sees noisy media while the teacher sees clean media.
+
+    When `distill=False`, a single processed dict is returned with corrupted
+    media (if `corrupt=True`) for standard noisy-input training.
     """
 
     def __init__(
@@ -304,8 +314,12 @@ class CorruptedMELDDataset(Dataset):
                 messages[:-1], tokenize=False, add_generation_prompt=True,
             )
         else:
+            # messages[-1] is the assistant turn carrying the ground-truth
+            # label. Drop it before rendering so the model generates from the
+            # prompt without seeing the answer. add_generation_prompt=True
+            # appends the marker where generation begins.
             rendered_text = self.processor.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True,
+                messages[:-1], tokenize=False, add_generation_prompt=True,
             )
             prompt_rendered = None
 
@@ -349,45 +363,47 @@ class CorruptedMELDDataset(Dataset):
     def __getitem__(self, idx):
         sample = self.raw_dataset[idx]
 
-        # Corrupt-once: applied before the split so teacher and student see
-        # identical media; only modality presence differs between the two.
-        text = sample["text"]
-        if self.corrupt and "text" in self.modalities:
-            text = corrupt_text(
-                text,
-                char_swap_prob=self.text_char_swap_prob,
-                word_drop_prob=self.text_word_drop_prob,
-            )
-
-        # If a file is missing or unreadable, fall back to a zero-filled tensor
-        # so the sample still contributes (with padding) rather than crashing.
-        frames = None
-        waveform = None
+        # Load clean raw media once. If file is missing, fall back to zero
+        # tensors so the sample still contributes rather than crashing.
+        clean_text = sample["text"]
+        clean_frames = None
+        clean_waveform = None
         if "video" in self.modalities:
             try:
-                frames = self._load_video_frames(sample["video_path"], self.fps)
+                clean_frames = self._load_video_frames(sample["video_path"], self.fps)
             except Exception:
-                # 2 black frames (minimum for temporal_patch_size=2), 224×224 RGB
-                frames = np.zeros((2, 224, 224, 3), dtype=np.uint8)
-            if self.corrupt:
-                noise = np.random.randn(*frames.shape).astype(np.float32) * self.video_noise_level * 255
-                frames = np.clip(frames.astype(np.float32) + noise, 0, 255).astype(np.uint8)
+                clean_frames = np.zeros((2, 224, 224, 3), dtype=np.uint8)
         if "audio" in self.modalities or "video" in self.modalities:
             try:
-                waveform, _ = load_audio_from_video(sample["video_path"], target_sr=self.audio_sr)
+                clean_waveform, _ = load_audio_from_video(sample["video_path"], target_sr=self.audio_sr)
             except Exception:
-                # 1 second of silence at the target sample rate
-                waveform = np.zeros(self.audio_sr, dtype=np.float32)
-            if self.corrupt:
-                waveform = corrupt_audio(waveform, noise_level=self.audio_noise_level)
+                clean_waveform = np.zeros(self.audio_sr, dtype=np.float32)
+
+        # Build corrupted copies (only used where noise applies).
+        corrupt_text_str = clean_text
+        corrupt_frames = clean_frames
+        corrupt_waveform = clean_waveform
+        if self.corrupt:
+            if "text" in self.modalities:
+                corrupt_text_str = corrupt_text(
+                    clean_text,
+                    char_swap_prob=self.text_char_swap_prob,
+                    word_drop_prob=self.text_word_drop_prob,
+                )
+            if clean_frames is not None:
+                noise = np.random.randn(*clean_frames.shape).astype(np.float32) * self.video_noise_level * 255
+                corrupt_frames = np.clip(clean_frames.astype(np.float32) + noise, 0, 255).astype(np.uint8)
+            if clean_waveform is not None:
+                corrupt_waveform = corrupt_audio(clean_waveform, noise_level=self.audio_noise_level)
 
         if self.distill:
-            full_item = self._process(sample, text, frames, waveform, self.modalities)
+            # Teacher: clean inputs, all modalities (no masking).
+            full_item = self._process(sample, clean_text, clean_frames, clean_waveform, self.modalities)
             full_item["emotion"] = sample["emotion"]
             full_item["label"] = sample["label"]
 
-            kept = self._sample_kept_modalities()
-            mask_item = self._process(sample, text, frames, waveform, kept)
+            # Student: corrupted inputs, all modalities (no masking).
+            mask_item = self._process(sample, corrupt_text_str, corrupt_frames, corrupt_waveform, self.modalities)
             mask_item["emotion"] = sample["emotion"]
             mask_item["label"] = sample["label"]
 
@@ -398,7 +414,8 @@ class CorruptedMELDDataset(Dataset):
                 "label": sample["label"],
             }
 
-        result = self._process(sample, text, frames, waveform, self.modalities)
+        # Non-distill: single pass with corrupted inputs (if corrupt=True).
+        result = self._process(sample, corrupt_text_str, corrupt_frames, corrupt_waveform, self.modalities)
         result["emotion"] = sample["emotion"]
         result["label"] = sample["label"]
         return result

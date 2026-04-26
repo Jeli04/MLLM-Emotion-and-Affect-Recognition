@@ -28,11 +28,26 @@ class StudentTeacherTrainer(Trainer):
     """Trainer that applies CE + λ·KL(sg(p_full) || p_mask) when inputs are
     paired {"full": ..., "mask": ...} dicts. Falls back to the default CE path
     for unpaired inputs, so non-distill runs are unaffected.
+
+    Teacher (full-modality pass) runs with the LoRA adapter DISABLED — so it
+    evaluates the frozen base model. The student runs with LoRA active, so it
+    learns to match the base-model-with-full-modalities prediction while
+    having only a masked-modality view.
     """
 
     def __init__(self, *args, lambda_kl=1.0, **kwargs):
         super().__init__(*args, **kwargs)
         self.lambda_kl = lambda_kl
+
+    @staticmethod
+    def _peft_model(m):
+        """Unwrap accelerate/DDP wrappers to find the underlying PeftModel."""
+        while not hasattr(m, "disable_adapter"):
+            if hasattr(m, "module"):
+                m = m.module
+            else:
+                return None
+        return m
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         if "full" not in inputs or "mask" not in inputs:
@@ -45,9 +60,16 @@ class StudentTeacherTrainer(Trainer):
         full_inputs = {k: v for k, v in inputs["full"].items() if k != "labels"}
         mask_inputs = inputs["mask"]
 
-        with torch.no_grad():
-            full_out = model(**full_inputs)
+        # Teacher: frozen base model (LoRA disabled), no grad.
+        peft = self._peft_model(model)
+        if peft is not None:
+            with torch.no_grad(), peft.disable_adapter():
+                full_out = model(**full_inputs)
+        else:
+            with torch.no_grad():
+                full_out = model(**full_inputs)
 
+        # Student: LoRA active, full autograd.
         mask_out = model(**mask_inputs)
         ce_loss = mask_out.loss
 
@@ -101,6 +123,13 @@ def parse_args():
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=8)
     parser.add_argument("--learning_rate", type=float, default=1e-4)
+    parser.add_argument("--max_grad_norm", type=float, default=1.0,
+                        help="Gradient clipping threshold (HF default 1.0). Lower "
+                             "values (e.g. 0.5) help with fp16 instability.")
+    parser.add_argument("--precision", choices=["fp16", "bf16"], default="bf16",
+                        help="Mixed-precision dtype. bf16 has wider dynamic range "
+                             "than fp16 and doesn't need a loss scaler; use fp16 "
+                             "only if your GPU lacks bf16 support.")
     parser.add_argument("--lora_r", type=int, default=16)
     parser.add_argument("--lora_alpha", type=int, default=32)
     parser.add_argument("--lora_dropout", type=float, default=0.05)
@@ -152,10 +181,11 @@ def main():
             os.environ["WANDB_ENTITY"] = args.wandb_entity
 
     processor = Qwen2_5OmniProcessor.from_pretrained(args.model_path)
+    dtype = torch.bfloat16 if args.precision == "bf16" else torch.float16
     model = Qwen2_5OmniForConditionalGeneration.from_pretrained(
         args.model_path,
         device_map="auto",
-        torch_dtype=torch.float16,
+        torch_dtype=dtype,
     )
 
     lora_config = LoraConfig(
@@ -217,7 +247,9 @@ def main():
         save_total_limit=3,
         eval_strategy="steps",
         eval_steps=args.save_steps,
-        fp16=True,
+        fp16=(args.precision == "fp16"),
+        bf16=(args.precision == "bf16"),
+        max_grad_norm=args.max_grad_norm,
         report_to="wandb" if args.wandb else "none",
         run_name=run_name,
         remove_unused_columns=False,

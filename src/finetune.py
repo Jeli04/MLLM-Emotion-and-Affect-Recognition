@@ -95,44 +95,78 @@ class StudentTeacherTrainer(Trainer):
         return teacher_out
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
-        if "full" not in inputs or "mask" not in inputs:
+        is_cached_distill = "mask" in inputs and "teacher_response_logits" in inputs
+        if ("full" not in inputs or "mask" not in inputs) and not is_cached_distill:
             return super().compute_loss(
                 model, inputs,
                 return_outputs=return_outputs,
                 num_items_in_batch=num_items_in_batch,
             )
 
-        full_inputs = inputs["full"]
-        full_inputs_no_labels = {k: v for k, v in full_inputs.items() if k != "labels"}
+        full_inputs = inputs.get("full")
+        full_inputs_no_labels = (
+            {k: v for k, v in full_inputs.items() if k != "labels"}
+            if full_inputs is not None
+            else None
+        )
         mask_inputs = inputs["mask"]
+        mask_inputs_no_labels = {k: v for k, v in mask_inputs.items() if k != "labels"}
 
         self._set_adapter(model, self.student_adapter_name, trainable=True)
         use_cached_teacher = "teacher_response_logits" in inputs
         needs_full_student = (
+            full_inputs is not None
+            and (
+                self.full_ce_weight > 0
+                or (
+                    not use_cached_teacher
+                    and self.teacher_adapter_name is None
+                    and not self.base_teacher
+                )
+            )
+        )
+        if full_inputs is None and (
             self.full_ce_weight > 0
             or (
                 not use_cached_teacher
                 and self.teacher_adapter_name is None
                 and not self.base_teacher
             )
-        )
-        full_student_out = model(**full_inputs) if needs_full_student else None
-        mask_out = model(**mask_inputs)
-        mask_ce_loss = mask_out.loss
-        full_ce_loss = (
-            full_student_out.loss
-            if full_student_out is not None
-            else torch.zeros((), device=mask_ce_loss.device, dtype=mask_ce_loss.dtype)
-        )
-        ce_loss = self.full_ce_weight * full_ce_loss + self.mask_ce_weight * mask_ce_loss
+        ):
+            raise ValueError("Distillation needs full inputs, but the batch only has mask inputs")
 
         def response_logits_and_labels(logits, labels):
-            shift_logits = logits[..., :-1, :].contiguous()
-            shift_labels = labels[..., 1:].contiguous()
+            # Only gather supervised response rows. Model-side CE would build a
+            # huge fp32 [sequence, vocab] workspace for ignored multimodal
+            # tokens; a full contiguous shift would add another large copy.
+            shift_logits = logits[..., :-1, :]
+            shift_labels = labels[..., 1:]
             keep = shift_labels != -100
             return shift_logits[keep], shift_labels[keep]
 
-        student_resp, _ = response_logits_and_labels(mask_out.logits, mask_inputs["labels"])
+        full_student_out = model(**full_inputs_no_labels) if needs_full_student else None
+        mask_out = model(**mask_inputs_no_labels)
+        student_resp, student_labels = response_logits_and_labels(
+            mask_out.logits, mask_inputs["labels"],
+        )
+
+        if student_resp.numel() == 0:
+            mask_ce_loss = torch.zeros((), device=mask_out.logits.device, dtype=mask_out.logits.dtype)
+        else:
+            mask_ce_loss = F.cross_entropy(student_resp.float(), student_labels)
+
+        if full_student_out is not None:
+            full_resp, full_labels = response_logits_and_labels(
+                full_student_out.logits, full_inputs["labels"],
+            )
+            full_ce_loss = (
+                F.cross_entropy(full_resp.float(), full_labels)
+                if full_resp.numel() > 0
+                else torch.zeros((), device=mask_ce_loss.device, dtype=mask_ce_loss.dtype)
+            )
+        else:
+            full_ce_loss = torch.zeros((), device=mask_ce_loss.device, dtype=mask_ce_loss.dtype)
+        ce_loss = self.full_ce_weight * full_ce_loss + self.mask_ce_weight * mask_ce_loss
 
         if use_cached_teacher:
             device = mask_out.logits.device
@@ -287,6 +321,10 @@ def parse_args():
 
 def main():
     args = parse_args()
+    using_cached_teacher = args.distill and args.teacher_logits_dir is not None
+    if using_cached_teacher and args.teacher_adapter_path is not None:
+        print("Using cached teacher logits; teacher_adapter_path will not be loaded at train time.")
+
     print(
         f"Finetuning with modalities={args.modalities}, corrupt={args.corrupt}, "
         f"modality_mask={args.modality_mask}, clean_teacher={args.clean_teacher}, "
@@ -320,7 +358,7 @@ def main():
 
     thinker = get_peft_model(model.thinker, lora_config)
     teacher_adapter_name = None
-    if args.teacher_adapter_path is not None:
+    if args.teacher_adapter_path is not None and not using_cached_teacher:
         teacher_adapter_name = "teacher"
         thinker.load_adapter(
             args.teacher_adapter_path,
@@ -355,6 +393,9 @@ def main():
         distill=args.distill,
         modality_mask=args.modality_mask,
         clean_teacher=args.clean_teacher,
+        include_full_branch=not (
+            args.distill and args.teacher_logits_dir is not None and args.full_ce_weight == 0
+        ),
     )
     train_logits_dir = (
         os.path.join(args.teacher_logits_dir, "train")

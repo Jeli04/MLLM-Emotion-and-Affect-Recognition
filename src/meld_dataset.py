@@ -243,11 +243,11 @@ class CorruptedMELDDataset(Dataset):
     then runs the processor to produce model-ready inputs.
 
     When `distill=True`, __getitem__ returns a paired {"full": ..., "mask": ...}
-    dict. The full item uses all modalities; the mask item uses either all
-    modalities or a random non-empty strict subset, depending on
-    `modality_mask`. By default corruption is shared across both passes; with
-    `clean_teacher=True`, the full branch stays uncorrupted while the mask
-    branch follows the corruption setting.
+    dict unless `include_full_branch=False`. The full item uses all modalities;
+    the mask item uses either all modalities or a random non-empty strict subset,
+    depending on `modality_mask`. By default corruption is shared across both
+    passes; with `clean_teacher=True`, the full branch stays uncorrupted while
+    the mask branch follows the corruption setting.
     """
 
     def __init__(
@@ -268,6 +268,7 @@ class CorruptedMELDDataset(Dataset):
         modality_mask=True,
         clean_teacher=False,
         teacher_logits_dir=None,
+        include_full_branch=True,
     ):
         self.raw_dataset = RawMELDDataset(
             meld_root, split=split, load_audio=False, audio_sr=audio_sr,
@@ -286,6 +287,7 @@ class CorruptedMELDDataset(Dataset):
         self.modality_mask = modality_mask
         self.clean_teacher = clean_teacher
         self.teacher_logits_dir = teacher_logits_dir
+        self.include_full_branch = include_full_branch
 
     def __len__(self):
         return len(self.raw_dataset)
@@ -407,23 +409,23 @@ class CorruptedMELDDataset(Dataset):
                         full_text, full_frames, full_waveform,
                     )
 
-            full_item = self._process(
-                sample, full_text, full_frames, full_waveform, self.modalities,
-            )
-            full_item["emotion"] = sample["emotion"]
-            full_item["label"] = sample["label"]
-
             kept = self._sample_kept_modalities() if self.modality_mask else self.modalities
             mask_item = self._process(sample, mask_text, mask_frames, mask_waveform, kept)
             mask_item["emotion"] = sample["emotion"]
             mask_item["label"] = sample["label"]
 
             result = {
-                "full": full_item,
                 "mask": mask_item,
                 "emotion": sample["emotion"],
                 "label": sample["label"],
             }
+            if self.include_full_branch:
+                full_item = self._process(
+                    sample, full_text, full_frames, full_waveform, self.modalities,
+                )
+                full_item["emotion"] = sample["emotion"]
+                full_item["label"] = sample["label"]
+                result["full"] = full_item
             if self.teacher_logits_dir is not None:
                 cache_path = os.path.join(
                     self.teacher_logits_dir, f"sample_{idx:06d}.pt"
@@ -518,15 +520,21 @@ def collate_fn(batch, pad_token_id, padding_side="left", label_pad_id=-100):
     If samples carry `prompt_len`, builds an HF-Trainer-ready `labels` tensor
     where prompt and padding positions are masked to `label_pad_id`.
 
-    If samples are paired {"full": ..., "mask": ...} (distill mode), returns
-    {"full": <collated>, "mask": <collated>, "labels": <mask labels>}. The
-    top-level "labels" key exists so HF Trainer's num_items_in_batch
-    accounting can find a labels tensor.
+    If samples are paired {"full": ..., "mask": ...} or cached-teacher
+    {"mask": ...} items (distill mode), returns collated branches plus a
+    top-level "labels" key so HF Trainer's num_items_in_batch accounting can
+    find a labels tensor.
     """
-    if "full" in batch[0]:
-        full = _collate_single([b["full"] for b in batch], pad_token_id, padding_side, label_pad_id)
+    if "full" in batch[0] or "mask" in batch[0]:
         mask = _collate_single([b["mask"] for b in batch], pad_token_id, padding_side, label_pad_id)
-        out = {"full": full, "mask": mask}
+        out = {"mask": mask}
+        if "full" in batch[0]:
+            out["full"] = _collate_single(
+                [b["full"] for b in batch],
+                pad_token_id,
+                padding_side,
+                label_pad_id,
+            )
         if "labels" in mask:
             out["labels"] = mask["labels"]
         if "teacher_response_logits" in batch[0]:

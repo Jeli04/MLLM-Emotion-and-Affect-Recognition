@@ -18,8 +18,7 @@ module load cuda/12.4.0
 
 cd $SLURM_SUBMIT_DIR
 
-source ./.venv-qwen/bin/activate
 module load ffmpeg
-uv run python -m src.evaluate.evaluate_clean \
+PYTHONPATH=. uv run --active --no-sync python -m src.evaluate.evaluate_clean \
     --modalities audio video \
     "$@"

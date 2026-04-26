@@ -16,12 +16,12 @@ cd "$(dirname "$0")/.."
 # Per-model modality lists. Comment out combos that already have a result file.
 BASE_COMBOS=(
     # "text"               # done: results_test_text_base.json
-    "audio"
-    "video"
-    "text audio"
-    "text video"
-    "audio video"
-    "text audio video"
+    # "audio"              # done: results_test_audio_base.json
+    # "video"              # done: results_test_video_base.json
+    # "text audio"         # done: results_test_audio+text_base.json
+    # "text video"         # done: results_test_text+video_base.json
+    # "audio video"        # done: results_test_audio+video_base.json
+    # "text audio video"   # done: results_test_audio+text+video_base.json
 )
 
 FINETUNED_COMBOS=(

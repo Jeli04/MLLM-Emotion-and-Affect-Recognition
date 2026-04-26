@@ -136,9 +136,7 @@ class StudentTeacherTrainer(Trainer):
             raise ValueError("Distillation needs full inputs, but the batch only has mask inputs")
 
         def response_logits_and_labels(logits, labels):
-            # Only gather supervised response rows. Model-side CE would build a
-            # huge fp32 [sequence, vocab] workspace for ignored multimodal
-            # tokens; a full contiguous shift would add another large copy.
+            # Only gather supervised response row to reduce memory
             shift_logits = logits[..., :-1, :]
             shift_labels = labels[..., 1:]
             keep = shift_labels != -100
@@ -186,6 +184,7 @@ class StudentTeacherTrainer(Trainer):
             )
             teacher_labels = teacher_labels.detach()
 
+        # checks for cases where teacher output is completely empty
         if teacher_resp.numel() == 0:
             teacher_nll = torch.zeros((), device=ce_loss.device)
             teacher_token_acc = torch.zeros((), device=ce_loss.device)
@@ -195,6 +194,7 @@ class StudentTeacherTrainer(Trainer):
                 teacher_resp.argmax(dim=-1).eq(teacher_labels).float().mean()
             )
 
+        # checks for cases where the student output is nothing if all the modalilites are masked out
         if student_resp.numel() == 0 or student_resp.shape != teacher_resp.shape:
             loss = ce_loss
             kl_val = torch.zeros((), device=ce_loss.device)

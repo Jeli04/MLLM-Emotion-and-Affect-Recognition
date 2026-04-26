@@ -22,7 +22,12 @@ logging.getLogger().addFilter(
 import optimum.gptq.constants
 optimum.gptq.constants.BLOCK_PATTERNS.insert(0, "thinker.model.layers")
 
-from src.meld_dataset import CorruptedMELDDataset, collate_fn, EMOTION2ID
+from src.meld_dataset import (
+    CORRUPTION_PRESET_NAMES,
+    CorruptedMELDDataset,
+    collate_fn,
+    EMOTION2ID,
+)
 
 
 def parse_args():
@@ -48,6 +53,9 @@ def parse_args():
     parser.add_argument("--corrupt", action="store_true", default=True,
                         help="Apply noise/corruption to raw inputs")
     parser.add_argument("--no_corrupt", dest="corrupt", action="store_false")
+    parser.add_argument("--corruption_preset", default="medium",
+                        choices=CORRUPTION_PRESET_NAMES,
+                        help="Corruption preset to use when --corrupt is enabled")
 
     # W&B args
     parser.add_argument("--wandb", dest="wandb", action="store_true", default=True,
@@ -118,7 +126,10 @@ def make_compute_metrics(emotion_first_token_ids):
 
 def main():
     args = parse_args()
-    print(f"Finetuning with modalities={args.modalities}, corrupt={args.corrupt}, wandb={args.wandb}")
+    print(
+        f"Finetuning with modalities={args.modalities}, corrupt={args.corrupt}, "
+        f"corruption_preset={args.corruption_preset}, wandb={args.wandb}"
+    )
 
     # Set W&B env vars before Trainer is created
     if args.wandb:
@@ -169,6 +180,7 @@ def main():
         processor=processor,
         modalities=tuple(args.modalities),
         corrupt=args.corrupt,
+        corruption_preset=args.corruption_preset,
         for_training=True,
     )
     train_dataset = CorruptedMELDDataset(args.data_root, split="train", **common)

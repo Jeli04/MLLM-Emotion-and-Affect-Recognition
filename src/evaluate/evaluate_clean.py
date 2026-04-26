@@ -90,6 +90,11 @@ def parse_args():
         default=None,
         help="Cap number of IEMOCAP utterances (for smoke tests)",
     )
+    parser.add_argument(
+        "--output_dir",
+        default=None,
+        help="Directory where results are saved. Defaults to results/meld or results/iemocap.",
+    )
     return parser.parse_args()
 
 
@@ -340,9 +345,11 @@ def main():
     model_str = "finetuned" if args.adapter_path else "base"
     if args.dataset == "meld":
         output_filename = f"results_{args.split}_{modalities_str}_{model_str}.json"
+        output_dir = args.output_dir or os.path.join("results", "meld")
     else:
         output_filename = f"results_iemocap_{args.split}_{modalities_str}_{model_str}.json"
-    output_path = os.path.join("results", output_filename)
+        output_dir = args.output_dir or os.path.join("results", "iemocap")
+    output_path = os.path.join(output_dir, output_filename)
 
     results_json = {
         "dataset": args.dataset,
@@ -368,6 +375,7 @@ def main():
         "predictions": per_sample_results,
     }
 
+    os.makedirs(output_dir, exist_ok=True)
     with open(output_path, "w") as f:
         json.dump(results_json, f, indent=2)
     print(f"\nResults saved to {output_path}")

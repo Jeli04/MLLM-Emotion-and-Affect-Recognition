@@ -19,14 +19,12 @@ export PATH="$HOME/.local/bin:$PATH"
 
 cd $SLURM_SUBMIT_DIR
 source .venv/bin/activate
-PYTHONPATH=. uv run --active --no-sync python src/finetune.py \
+
+# Precompute base-teacher logits for all three modalities.
+# Override --teacher_adapter_path / --base_teacher / --output_dir / etc. via "$@".
+PYTHONPATH=. uv run --active --no-sync python scripts/precompute_teacher_logits.py \
     --modalities text audio video \
-    --distill \
-    --no_modality_mask \
-    --clean_teacher \
-    --base_teacher \
-    --full_ce_weight 0.0 \
-    --mask_ce_weight 1.0 \
-    --lambda_kl 0.03 \
-    --output_dir ./ckpts/finetuned_distill_clean_teacher_base_lk0.03 \
-    --wandb_run_name distill_clean_teacher_base_lk0.03
+    --splits train dev \
+    --teacher_adapter_path  /project2/robinjia_875/lijc/MLLM-Emotion-and-Affect-Recognition/ckpts/finetuned_base/lora_adapter/ \
+    --output_dir ./cache/teacher_logits/finetuned_t+a+v \
+    "$@"

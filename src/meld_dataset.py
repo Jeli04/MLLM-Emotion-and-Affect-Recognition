@@ -267,6 +267,7 @@ class CorruptedMELDDataset(Dataset):
         distill=False,
         modality_mask=True,
         clean_teacher=False,
+        teacher_logits_dir=None,
     ):
         self.raw_dataset = RawMELDDataset(
             meld_root, split=split, load_audio=False, audio_sr=audio_sr,
@@ -284,6 +285,7 @@ class CorruptedMELDDataset(Dataset):
         self.distill = distill
         self.modality_mask = modality_mask
         self.clean_teacher = clean_teacher
+        self.teacher_logits_dir = teacher_logits_dir
 
     def __len__(self):
         return len(self.raw_dataset)
@@ -416,12 +418,20 @@ class CorruptedMELDDataset(Dataset):
             mask_item["emotion"] = sample["emotion"]
             mask_item["label"] = sample["label"]
 
-            return {
+            result = {
                 "full": full_item,
                 "mask": mask_item,
                 "emotion": sample["emotion"],
                 "label": sample["label"],
             }
+            if self.teacher_logits_dir is not None:
+                cache_path = os.path.join(
+                    self.teacher_logits_dir, f"sample_{idx:06d}.pt"
+                )
+                cached = torch.load(cache_path, map_location="cpu", weights_only=True)
+                result["teacher_response_logits"] = cached["response_logits"]
+                result["teacher_response_labels"] = cached["response_labels"]
+            return result
 
         if self.corrupt:
             text, frames, waveform = self._corrupt_media(text, frames, waveform)
@@ -519,6 +529,9 @@ def collate_fn(batch, pad_token_id, padding_side="left", label_pad_id=-100):
         out = {"full": full, "mask": mask}
         if "labels" in mask:
             out["labels"] = mask["labels"]
+        if "teacher_response_logits" in batch[0]:
+            out["teacher_response_logits"] = [b["teacher_response_logits"] for b in batch]
+            out["teacher_response_labels"] = [b["teacher_response_labels"] for b in batch]
         return out
 
     return _collate_single(batch, pad_token_id, padding_side, label_pad_id)

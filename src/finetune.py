@@ -107,9 +107,14 @@ class StudentTeacherTrainer(Trainer):
         mask_inputs = inputs["mask"]
 
         self._set_adapter(model, self.student_adapter_name, trainable=True)
+        use_cached_teacher = "teacher_response_logits" in inputs
         needs_full_student = (
             self.full_ce_weight > 0
-            or (self.teacher_adapter_name is None and not self.base_teacher)
+            or (
+                not use_cached_teacher
+                and self.teacher_adapter_name is None
+                and not self.base_teacher
+            )
         )
         full_student_out = model(**full_inputs) if needs_full_student else None
         mask_out = model(**mask_inputs)
@@ -121,9 +126,6 @@ class StudentTeacherTrainer(Trainer):
         )
         ce_loss = self.full_ce_weight * full_ce_loss + self.mask_ce_weight * mask_ce_loss
 
-        teacher_out = self._teacher_forward(model, full_inputs_no_labels, full_student_out)
-        teacher_logits = teacher_out.logits.detach()
-
         def response_logits_and_labels(logits, labels):
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
@@ -131,10 +133,24 @@ class StudentTeacherTrainer(Trainer):
             return shift_logits[keep], shift_labels[keep]
 
         student_resp, _ = response_logits_and_labels(mask_out.logits, mask_inputs["labels"])
-        teacher_resp, teacher_labels = response_logits_and_labels(
-            teacher_logits, full_inputs["labels"],
-        )
-        teacher_labels = teacher_labels.detach()
+
+        if use_cached_teacher:
+            device = mask_out.logits.device
+            teacher_resp = torch.cat(
+                [t.to(device) for t in inputs["teacher_response_logits"]], dim=0
+            ).detach()
+            teacher_labels = torch.cat(
+                [t.to(device) for t in inputs["teacher_response_labels"]], dim=0
+            ).detach()
+        else:
+            teacher_out = self._teacher_forward(
+                model, full_inputs_no_labels, full_student_out,
+            )
+            teacher_logits = teacher_out.logits.detach()
+            teacher_resp, teacher_labels = response_logits_and_labels(
+                teacher_logits, full_inputs["labels"],
+            )
+            teacher_labels = teacher_labels.detach()
 
         if teacher_resp.numel() == 0:
             teacher_nll = torch.zeros((), device=ce_loss.device)
@@ -248,6 +264,11 @@ def parse_args():
     parser.add_argument("--base_teacher", action="store_true", default=False,
                         help="Use the frozen base model with adapters disabled as the "
                              "teacher. Ignored when --teacher_adapter_path is set.")
+    parser.add_argument("--teacher_logits_dir", type=str, default=None,
+                        help="Directory of precomputed teacher response-slice logits "
+                             "(produced by scripts/precompute_teacher_logits.py). When "
+                             "set, the live teacher forward is skipped and cached "
+                             "logits are used for KL.")
 
     # W&B args
     parser.add_argument("--wandb", dest="wandb", action="store_true", default=True,
@@ -335,8 +356,20 @@ def main():
         modality_mask=args.modality_mask,
         clean_teacher=args.clean_teacher,
     )
-    train_dataset = CorruptedMELDDataset(args.data_root, split="train", **common)
-    val_dataset = CorruptedMELDDataset(args.data_root, split="dev", **common)
+    train_logits_dir = (
+        os.path.join(args.teacher_logits_dir, "train")
+        if args.teacher_logits_dir else None
+    )
+    val_logits_dir = (
+        os.path.join(args.teacher_logits_dir, "dev")
+        if args.teacher_logits_dir else None
+    )
+    train_dataset = CorruptedMELDDataset(
+        args.data_root, split="train", teacher_logits_dir=train_logits_dir, **common,
+    )
+    val_dataset = CorruptedMELDDataset(
+        args.data_root, split="dev", teacher_logits_dir=val_logits_dir, **common,
+    )
 
     data_collator = partial(
         collate_fn,

@@ -24,7 +24,7 @@ PYTHONPATH=. uv run --active --no-sync python src/finetune.py \
     --distill \
     --no_modality_mask \
     --clean_teacher \
-    --base-teacher \
+    --base_teacher \
     --full_ce_weight 0.0 \
     --mask_ce_weight 1.0 \
     --lambda_kl 0.03 \

@@ -10,7 +10,7 @@ from functools import partial
 warnings.filterwarnings("ignore")
 logging.getLogger("root").setLevel(logging.ERROR)
 
-from transformers import Qwen2_5OmniForConditionalGeneration, Qwen2_5OmniProcessor
+from transformers import Qwen2_5OmniForConditionalGeneration, Qwen2_5OmniProcessor, set_seed
 from peft import PeftModel
 import torch
 from torch.utils.data import DataLoader
@@ -25,7 +25,13 @@ from sklearn.preprocessing import label_binarize
 import optimum.gptq.constants
 optimum.gptq.constants.BLOCK_PATTERNS.insert(0, "thinker.model.layers")
 
-from src.meld_dataset import CorruptedMELDDataset, collate_fn, EMOTION2ID, SYSTEM_PROMPT
+from src.meld_dataset import (
+    CORRUPTION_PRESET_NAMES,
+    CorruptedMELDDataset,
+    collate_fn,
+    EMOTION2ID,
+    SYSTEM_PROMPT,
+)
 
 ID2EMOTION = {v: k for k, v in EMOTION2ID.items()}
 VALID_EMOTIONS = set(EMOTION2ID.keys())
@@ -59,26 +65,30 @@ def parse_args():
                         help="Apply noise/corruption to inputs (default: True)")
     parser.add_argument("--no_corrupt", dest="corrupt", action="store_false",
                         help="Disable input corruption")
+    parser.add_argument("--corruption_preset", default="medium",
+                        choices=CORRUPTION_PRESET_NAMES,
+                        help="Corruption preset to use when --corrupt is enabled")
     parser.add_argument("--output_dir", default=os.path.join("results", "dpo"),
                         help="Directory where evaluation and DPO files are saved")
     parser.add_argument("--correct_sample_ratio", type=float, default=0.15,
                         help="Target fraction of final DPO samples drawn from correct model predictions")
     parser.add_argument("--correct_sample_seed", type=int, default=42,
                         help="Random seed for selecting correct-prediction DPO samples")
+    parser.add_argument("--seed", type=int, default=42,
+                        help="Random seed for model evaluation and input corruption")
     return parser.parse_args()
 
 
 def build_prompt_messages(raw_sample, modalities):
     """Build the prompt side of a preference example in chat-message format."""
     user_content = []
-    has_video = "video" in modalities
 
     for mod in modalities:
         if mod == "text":
             user_content.append({"type": "text", "text": raw_sample["text"]})
         elif mod == "video":
             user_content.append({"type": "video", "video": raw_sample["video_path"]})
-        elif mod == "audio" and not has_video:
+        elif mod == "audio":
             user_content.append({"type": "audio", "audio": raw_sample["video_path"]})
 
     return [
@@ -95,6 +105,7 @@ def build_dpo_sample(
     raw_output,
     modalities,
     corrupt,
+    corruption_preset,
     rejected_emotion=None,
     selection_reason="confusion_pair_error",
 ):
@@ -119,6 +130,7 @@ def build_dpo_sample(
         "video_path": raw_sample["video_path"],
         "modalities": list(modalities),
         "corrupt": corrupt,
+        "corruption_preset": corruption_preset,
         "ground_truth": gt_emotion,
         "prediction": pred,
         "raw_model_output": raw_output,
@@ -171,7 +183,12 @@ def eval_collate(batch, pad_token_id):
 
 def main():
     args = parse_args()
-    print(f"Building DPO candidates from split='{args.split}' with modalities={args.modalities}, corrupt={args.corrupt}")
+    set_seed(args.seed)
+    print(
+        f"Building DPO candidates from split='{args.split}' with "
+        f"modalities={args.modalities}, corrupt={args.corrupt}, "
+        f"corruption_preset={args.corruption_preset}, seed={args.seed}"
+    )
     correct_sample_rng = random.Random(args.correct_sample_seed)
 
     processor = Qwen2_5OmniProcessor.from_pretrained(args.model_path)
@@ -194,6 +211,7 @@ def main():
         split=args.split,
         modalities=tuple(args.modalities),
         corrupt=args.corrupt,
+        corruption_preset=args.corruption_preset,
         for_training=False,
     )
 
@@ -234,7 +252,7 @@ def main():
                     max_new_tokens=128,
                     do_sample=False,
                     return_audio=False,
-                    use_audio_in_video=("video" in args.modalities),
+                    use_audio_in_video=False,
                 )
 
             generated_ids_trimmed = [
@@ -296,6 +314,7 @@ def main():
                         raw_output=raw_output,
                         modalities=args.modalities,
                         corrupt=args.corrupt,
+                        corruption_preset=args.corruption_preset,
                     )
                 )
             elif pred == gt_emotion:
@@ -308,6 +327,7 @@ def main():
                         raw_output=raw_output,
                         modalities=args.modalities,
                         corrupt=args.corrupt,
+                        corruption_preset=args.corruption_preset,
                         rejected_emotion=get_rejected_emotion_for_correct_sample(
                             gt_emotion,
                             correct_sample_rng,
@@ -330,7 +350,10 @@ def main():
     print("\n" + "=" * 60)
     print("RESULTS")
     print("=" * 60)
-    print(f"Split: {args.split} | Modalities: {args.modalities} | Corrupt: {args.corrupt}")
+    print(
+        f"Split: {args.split} | Modalities: {args.modalities} | "
+        f"Corrupt: {args.corrupt} | Preset: {args.corruption_preset}"
+    )
     print(f"Total samples: {len(dataset)}")
     print(f"Valid predictions: {len(all_preds)}")
     print(f"Invalid predictions: {len(invalid_predictions)}")
@@ -364,7 +387,7 @@ def main():
     print(f"\nPeak VRAM usage: {peak_vram:.2f} GB")
 
     modalities_str = "+".join(sorted(args.modalities))
-    corrupt_str = "corrupt" if args.corrupt else "clean"
+    corrupt_str = f"corrupt_{args.corruption_preset}" if args.corrupt else "clean"
     model_str = "finetuned" if args.adapter_path else "base"
     output_filename = f"results_{args.split}_{modalities_str}_{corrupt_str}_{model_str}.json"
     output_path = os.path.join(args.output_dir, output_filename)
@@ -375,7 +398,9 @@ def main():
         "split": args.split,
         "modalities": args.modalities,
         "corrupt": args.corrupt,
+        "corruption_preset": args.corruption_preset,
         "adapter_path": args.adapter_path,
+        "seed": args.seed,
         "total_samples": len(dataset),
         "valid_predictions": len(all_preds),
         "invalid_predictions": len(invalid_predictions),
@@ -408,8 +433,10 @@ def main():
         "split": args.split,
         "modalities": args.modalities,
         "corrupt": args.corrupt,
+        "corruption_preset": args.corruption_preset,
         "adapter_path": args.adapter_path,
         "model_path": args.model_path,
+        "seed": args.seed,
         "confusion_pairs": CONFUSION_PAIRS,
         "sample_count": len(dpo_samples),
         "confusion_pair_sample_count": confusion_pair_sample_count,

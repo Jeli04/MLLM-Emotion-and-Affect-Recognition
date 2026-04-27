@@ -14,6 +14,7 @@ from transformers import (
     Qwen2_5OmniProcessor,
     Trainer,
     TrainingArguments,
+    set_seed,
 )
 
 # prevents warning message from being displayed
@@ -327,9 +328,10 @@ def maybe_split_dataset(dataset, eval_ratio, seed):
 
 def main():
     args = parse_args()
+    set_seed(args.seed)
     print(
         f"DPO training with data={args.dpo_data_path}, modalities={args.modalities}, "
-        f"corrupt={args.corrupt}, beta={args.beta}, wandb={args.wandb}"
+        f"corrupt={args.corrupt}, beta={args.beta}, wandb={args.wandb}, seed={args.seed}"
     )
 
     if args.wandb:
@@ -399,6 +401,8 @@ def main():
         run_name=run_name,
         remove_unused_columns=False,
         dataloader_num_workers=0,
+        seed=args.seed,
+        data_seed=args.seed,
     )
 
     trainer = PreferenceTrainer(

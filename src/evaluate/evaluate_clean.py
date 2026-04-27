@@ -9,7 +9,7 @@ from pathlib import Path
 warnings.filterwarnings("ignore")
 logging.getLogger("root").setLevel(logging.ERROR)
 
-from transformers import Qwen2_5OmniForConditionalGeneration, Qwen2_5OmniProcessor
+from transformers import Qwen2_5OmniForConditionalGeneration, Qwen2_5OmniProcessor, set_seed
 from peft import PeftModel
 import torch
 from tqdm import tqdm
@@ -95,6 +95,8 @@ def parse_args():
         default=None,
         help="Directory where results are saved. Defaults to results/meld or results/iemocap.",
     )
+    parser.add_argument("--seed", type=int, default=42,
+                        help="Random seed for python/numpy/torch")
     return parser.parse_args()
 
 
@@ -194,8 +196,10 @@ def build_messages(sample, modalities, system_prompt):
 
 def main():
     args = parse_args()
+    set_seed(args.seed)
     print(
-        f"Evaluating dataset='{args.dataset}' split='{args.split}' with modalities={args.modalities}"
+        f"Evaluating dataset='{args.dataset}' split='{args.split}' with modalities={args.modalities}, "
+        f"seed={args.seed}"
     )
 
     if args.dataset == "meld":

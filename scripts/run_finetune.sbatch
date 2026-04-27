@@ -18,5 +18,9 @@ module load cuda/12.4.0
 
 cd $SLURM_SUBMIT_DIR
 
+source ./.venv/bin/activate
 module load ffmpeg
-PYTHONPATH=. uv run --active --no-sync python src/finetune.py --modalities text audio video --corruption_preset medium
+PYTHONPATH=. python src/finetune.py \
+    --modalities text audio video \
+    --corruption_preset medium \
+    "$@"

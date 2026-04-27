@@ -8,7 +8,7 @@ from functools import partial
 warnings.filterwarnings("ignore")
 logging.getLogger("root").setLevel(logging.ERROR)
 
-from transformers import Qwen2_5OmniForConditionalGeneration, Qwen2_5OmniProcessor
+from transformers import Qwen2_5OmniForConditionalGeneration, Qwen2_5OmniProcessor, set_seed
 from peft import PeftModel
 import torch
 from torch.utils.data import DataLoader
@@ -56,6 +56,8 @@ def parse_args():
                         help="Corruption preset to use when corruption is enabled")
     parser.add_argument("--output_dir", default=os.path.join("results", "meld"),
                         help="Directory where MELD corruption results are saved")
+    parser.add_argument("--seed", type=int, default=42,
+                        help="Random seed for python/numpy/torch (controls corruption RNG)")
     return parser.parse_args()
 
 
@@ -70,9 +72,11 @@ def eval_collate(batch, pad_token_id):
 
 def main():
     args = parse_args()
+    set_seed(args.seed)
     print(
         f"Evaluating on split='{args.split}' with modalities={args.modalities}, "
-        f"corrupt={args.corrupt}, corruption_preset={args.corruption_preset}"
+        f"corrupt={args.corrupt}, corruption_preset={args.corruption_preset}, "
+        f"seed={args.seed}"
     )
 
     processor = Qwen2_5OmniProcessor.from_pretrained(args.model_path)
@@ -129,7 +133,7 @@ def main():
                     max_new_tokens=128,
                     do_sample=False,
                     return_audio=False,
-                    use_audio_in_video=("video" in args.modalities),
+                    use_audio_in_video=False,
                 )
 
             generated_ids_trimmed = [

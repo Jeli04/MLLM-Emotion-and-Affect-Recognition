@@ -10,6 +10,7 @@ from transformers import (
     Qwen2_5OmniProcessor,
     TrainingArguments,
     Trainer,
+    set_seed,
 )
 from peft import LoraConfig, get_peft_model, TaskType
 
@@ -56,6 +57,10 @@ def parse_args():
     parser.add_argument("--corruption_preset", default="medium",
                         choices=CORRUPTION_PRESET_NAMES,
                         help="Corruption preset to use when --corrupt is enabled")
+    parser.add_argument("--predict_corruption", action="store_true",
+                        help="Train the assistant to output emotion plus corrupted input modalities")
+    parser.add_argument("--seed", type=int, default=42,
+                        help="Random seed for python, numpy, torch, and HF Trainer")
 
     # W&B args
     parser.add_argument("--wandb", dest="wandb", action="store_true", default=True,
@@ -72,9 +77,32 @@ def parse_args():
     return parser.parse_args()
 
 
+def _unwrap_logits(logits, labels):
+    """Extract the token logits tensor from model outputs passed by Trainer."""
+    if isinstance(logits, torch.Tensor):
+        return logits
+    if hasattr(logits, "logits"):
+        return logits.logits
+    if isinstance(logits, (tuple, list)):
+        for item in logits:
+            if isinstance(item, torch.Tensor) and item.ndim >= 3:
+                if labels is None or item.shape[:2] == labels.shape[:2]:
+                    return item
+        for item in logits:
+            if isinstance(item, torch.Tensor):
+                return item
+        for item in logits:
+            try:
+                return _unwrap_logits(item, labels)
+            except TypeError:
+                continue
+    raise TypeError(f"Could not find logits tensor in output type {type(logits)}")
+
+
 def preprocess_logits_for_metrics(logits, labels):
     # Reduce [batch, seq_len, vocab_size] → [batch, seq_len] before Trainer
     # stores them, otherwise the full logit tensor OOMs on large sequences.
+    logits = _unwrap_logits(logits, labels)
     return logits.argmax(dim=-1)
 
 
@@ -126,9 +154,12 @@ def make_compute_metrics(emotion_first_token_ids):
 
 def main():
     args = parse_args()
+    set_seed(args.seed)
     print(
         f"Finetuning with modalities={args.modalities}, corrupt={args.corrupt}, "
-        f"corruption_preset={args.corruption_preset}, wandb={args.wandb}"
+        f"corruption_preset={args.corruption_preset}, "
+        f"predict_corruption={args.predict_corruption}, wandb={args.wandb}, "
+        f"seed={args.seed}"
     )
 
     # Set W&B env vars before Trainer is created
@@ -181,6 +212,7 @@ def main():
         modalities=tuple(args.modalities),
         corrupt=args.corrupt,
         corruption_preset=args.corruption_preset,
+        predict_corruption=args.predict_corruption,
         for_training=True,
     )
     train_dataset = CorruptedMELDDataset(args.data_root, split="train", **common)
@@ -213,6 +245,8 @@ def main():
         run_name=run_name,
         remove_unused_columns=False,
         dataloader_num_workers=0,
+        seed=args.seed,
+        data_seed=args.seed,
     )
 
     trainer = Trainer(

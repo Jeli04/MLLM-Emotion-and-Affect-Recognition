@@ -37,6 +37,16 @@ SYSTEM_PROMPT = (
     "anger, disgust, fear, joy, neutral, sadness, surprise."
 )
 
+CORRUPTION_AWARE_SYSTEM_PROMPT = (
+    "Your job as a helpful assistant is to detect what emotion is being expressed "
+    "from the inputs and identify which input modalities are corrupted. "
+    "Output exactly two lines. The first line must be one emotion word from: "
+    "anger, disgust, fear, joy, neutral, sadness, surprise. "
+    "The second line must be formatted exactly as: "
+    "corrupted_modalities: <comma-separated modalities or none>. "
+    "Valid modalities are text, audio, video."
+)
+
 ID2EMOTION = {v: k for k, v in EMOTION2ID.items()}
 
 CORRUPTION_PRESETS = {
@@ -55,6 +65,8 @@ CORRUPTION_PRESETS = {
         "video_corruptions": ["noise", "blur", "brightness_contrast"],
         "video_occlusion_area_ratio": 0.04,
         "video_blur_radius": 0.75,
+        "video_motion_blur_kernel": 3,
+        "video_defocus_radius": 1.0,
         "video_pixelate_factor": 2,
         "video_drop_frame_ratio": 0.05,
         "video_brightness": 0.9,
@@ -65,21 +77,23 @@ CORRUPTION_PRESETS = {
     "medium": {
         "text_char_swap_prob": 0.04,
         "text_word_drop_prob": 0.03,
-        "audio_noise_level": 0.02,
-        "audio_corruptions": ["snr_noise", "dropout", "lowpass"],
+        "audio_noise_level": 0.05,
+        "audio_corruptions": ["snr_noise", "noise", "dropout", "lowpass"],
         "audio_snr_db": 12.0,
         "audio_dropout_ratio": 0.06,
         "audio_dropout_chunks": 2,
         "audio_clip_gain": 1.4,
         "audio_clip_level": 0.8,
         "audio_lowpass_hz": 4500.0,
-        "video_noise_level": 0.025,
+        "video_noise_level": 0.05,
         "video_corruptions": [
-            "noise", "occlusion", "blur", "pixelate",
-            "brightness_contrast",
+            "noise", "occlusion", "blur", "motion_blur", "defocus_blur",
+            "pixelate", "brightness_contrast",
         ],
         "video_occlusion_area_ratio": 0.08,
         "video_blur_radius": 1.5,
+        "video_motion_blur_kernel": 7,
+        "video_defocus_radius": 2.5,
         "video_pixelate_factor": 4,
         "video_drop_frame_ratio": 0.10,
         "video_brightness": 0.80,
@@ -90,21 +104,23 @@ CORRUPTION_PRESETS = {
     "strong": {
         "text_char_swap_prob": 0.06,
         "text_word_drop_prob": 0.05,
-        "audio_noise_level": 0.05,
-        "audio_corruptions": ["snr_noise", "dropout", "clip", "lowpass"],
+        "audio_noise_level": 0.12,
+        "audio_corruptions": ["snr_noise", "noise", "dropout", "clip", "lowpass"],
         "audio_snr_db": 5.0,
         "audio_dropout_ratio": 0.15,
         "audio_dropout_chunks": 3,
         "audio_clip_gain": 2.5,
         "audio_clip_level": 0.5,
         "audio_lowpass_hz": 3000.0,
-        "video_noise_level": 0.05,
+        "video_noise_level": 0.10,
         "video_corruptions": [
-            "noise", "occlusion", "blur", "pixelate", "drop_frames",
-            "brightness_contrast",
+            "noise", "occlusion", "blur", "motion_blur", "defocus_blur",
+            "pixelate", "drop_frames", "brightness_contrast",
         ],
         "video_occlusion_area_ratio": 0.20,
         "video_blur_radius": 4.0,
+        "video_motion_blur_kernel": 15,
+        "video_defocus_radius": 5.0,
         "video_pixelate_factor": 8,
         "video_drop_frame_ratio": 0.25,
         "video_brightness": 0.55,
@@ -401,6 +417,60 @@ def apply_video_blur(frames, radius):
     ]).astype(np.uint8)
 
 
+def _convolve_frame_per_channel(frame, kernel):
+    """2D convolve a uint8 HxWxC frame with a 2D float kernel, per channel."""
+    from scipy.ndimage import convolve as nd_convolve
+    out = np.empty_like(frame, dtype=np.float32)
+    for c in range(frame.shape[-1]):
+        out[..., c] = nd_convolve(frame[..., c].astype(np.float32), kernel, mode="reflect")
+    return np.clip(out, 0, 255).astype(np.uint8)
+
+
+def apply_video_motion_blur(frames, kernel_size, angle_deg=None):
+    """Linear motion blur: convolve each frame with a 1-pixel-wide line kernel.
+
+    A larger `kernel_size` corresponds to longer motion. If `angle_deg` is None,
+    a random angle in [0, 180) is drawn once per call (same angle across frames,
+    so the motion direction is consistent for the clip).
+    """
+    kernel_size = max(1, int(kernel_size))
+    if kernel_size <= 1:
+        return frames
+    if angle_deg is None:
+        angle_deg = random.uniform(0.0, 180.0)
+    theta = math.radians(angle_deg)
+    dx, dy = math.cos(theta), math.sin(theta)
+
+    kernel = np.zeros((kernel_size, kernel_size), dtype=np.float32)
+    cx = cy = (kernel_size - 1) / 2.0
+    for t in np.linspace(-cx, cx, kernel_size * 2):
+        x = int(round(cx + t * dx))
+        y = int(round(cy + t * dy))
+        if 0 <= x < kernel_size and 0 <= y < kernel_size:
+            kernel[y, x] = 1.0
+    if kernel.sum() == 0:
+        kernel[int(cy), int(cx)] = 1.0
+    kernel /= kernel.sum()
+
+    return np.stack([_convolve_frame_per_channel(f, kernel) for f in frames])
+
+
+def apply_video_defocus_blur(frames, radius):
+    """Defocus blur: convolve each frame with a uniform disk kernel of given radius."""
+    radius = float(radius)
+    if radius <= 0.5:
+        return frames
+    size = 2 * int(math.ceil(radius)) + 1
+    cx = cy = size // 2
+    yy, xx = np.ogrid[:size, :size]
+    mask = ((xx - cx) ** 2 + (yy - cy) ** 2) <= radius ** 2
+    kernel = mask.astype(np.float32)
+    if kernel.sum() == 0:
+        kernel[cy, cx] = 1.0
+    kernel /= kernel.sum()
+    return np.stack([_convolve_frame_per_channel(f, kernel) for f in frames])
+
+
 def apply_video_pixelation(frames, factor):
     factor = max(2, int(factor))
     output = []
@@ -482,6 +552,10 @@ def apply_video_corruptions(frames, config):
             corrupted = apply_video_occlusion(corrupted, config["video_occlusion_area_ratio"])
         elif corruption == "blur":
             corrupted = apply_video_blur(corrupted, config["video_blur_radius"])
+        elif corruption == "motion_blur":
+            corrupted = apply_video_motion_blur(corrupted, config["video_motion_blur_kernel"])
+        elif corruption == "defocus_blur":
+            corrupted = apply_video_defocus_blur(corrupted, config["video_defocus_radius"])
         elif corruption == "pixelate":
             corrupted = apply_video_pixelation(corrupted, config["video_pixelate_factor"])
         elif corruption == "drop_frames":
@@ -509,22 +583,44 @@ def corrupt_video_frames(video_path, noise_level=0.05):
     dataset can flag that corruption is enabled."""
     return video_path
 
-def build_messages(sample, modalities):
+def get_corrupted_modalities(modalities, corrupt):
+    if not corrupt:
+        return []
+    return [mod for mod in ("text", "audio", "video") if mod in modalities]
+
+
+def format_assistant_response(sample, modalities, corrupt, predict_corruption=False):
+    if not predict_corruption:
+        return sample["emotion"]
+
+    corrupted_modalities = get_corrupted_modalities(modalities, corrupt)
+    corrupted_text = ",".join(corrupted_modalities) if corrupted_modalities else "none"
+    return f"{sample['emotion']}\ncorrupted_modalities: {corrupted_text}"
+
+
+def build_messages(sample, modalities, corrupt=False, predict_corruption=False):
     """Build chat messages for a single sample (same format as evaluate.py)."""
     user_content = []
-    has_video = "video" in modalities
     for mod in modalities:
         if mod == "text":
             user_content.append({"type": "text", "text": sample["text"]})
         elif mod == "video":
             user_content.append({"type": "video", "video": sample["video_path"]})
-        elif mod == "audio" and not has_video:
+        elif mod == "audio":
             user_content.append({"type": "audio", "audio": sample["video_path"]})
 
+    assistant_response = format_assistant_response(
+        sample,
+        modalities,
+        corrupt=corrupt,
+        predict_corruption=predict_corruption,
+    )
+    system_prompt = CORRUPTION_AWARE_SYSTEM_PROMPT if predict_corruption else SYSTEM_PROMPT
+
     messages = [
-        {"role": "system", "content": [{"type": "text", "text": SYSTEM_PROMPT}]},
+        {"role": "system", "content": [{"type": "text", "text": system_prompt}]},
         {"role": "user", "content": user_content},
-        {"role": "assistant", "content": [{"type": "text", "text": sample["emotion"]}]},
+        {"role": "assistant", "content": [{"type": "text", "text": assistant_response}]},
     ]
     return messages
 
@@ -567,6 +663,7 @@ class CorruptedMELDDataset(Dataset):
         video_crop_scale=None,
         video_jpeg_quality=None,
         for_training=False,
+        predict_corruption=False,
     ):
         corruption_config = get_corruption_config(
             corruption_preset,
@@ -606,6 +703,7 @@ class CorruptedMELDDataset(Dataset):
         self.audio_noise_level = corruption_config["audio_noise_level"]
         self.video_noise_level = corruption_config["video_noise_level"]
         self.for_training = for_training
+        self.predict_corruption = predict_corruption
 
     def __len__(self):
         return len(self.raw_dataset)
@@ -628,7 +726,12 @@ class CorruptedMELDDataset(Dataset):
         # Build messages and render chat template (text only, no media loading).
         # Training needs the assistant response IN the sequence + a way to mask
         # prompt tokens from the loss; inference needs the generation prompt.
-        messages = build_messages({**sample, "text": text}, self.modalities)
+        messages = build_messages(
+            {**sample, "text": text},
+            self.modalities,
+            corrupt=self.corrupt,
+            predict_corruption=self.predict_corruption,
+        )
         if self.for_training:
             rendered_text = self.processor.apply_chat_template(
                 messages, tokenize=False, add_generation_prompt=False,
@@ -648,7 +751,7 @@ class CorruptedMELDDataset(Dataset):
         videos = None
         audio = None
         has_video = "video" in self.modalities
-        has_audio = "audio" in self.modalities or has_video
+        has_audio = "audio" in self.modalities
 
         if has_video:
             try:
@@ -675,7 +778,7 @@ class CorruptedMELDDataset(Dataset):
         processor_kwargs = dict(
             videos=videos,
             audio=audio,
-            use_audio_in_video=has_video and has_audio,
+            use_audio_in_video=False,
             fps=self.fps,
             do_sample_frames=False,
             padding=True,
@@ -776,15 +879,68 @@ def collate_fn(batch, pad_token_id, padding_side="left", label_pad_id=-100):
 
 
 if __name__ == "__main__":
+    import sys
     from torch.utils.data import DataLoader
-    dataset = RawMELDDataset("/project2/robinjia_875/lijc/data/MELD.Raw", split="test", load_audio=True)
 
+    MELD_ROOT = "/project2/robinjia_875/lijc/data/MELD.Raw"
+
+    dataset = RawMELDDataset(MELD_ROOT, split="test", load_audio=True)
     sample = dataset[0]
     print(sample["text"])
     print(sample["audio"].shape if sample["audio"] is not None else None)
     print(sample["audio_sr"])
     print(sample["video_path"])
     print(sample.get("audio_error"))
-
     print(len(dataset))
     print(type(sample["audio"]))
+
+    # tests 
+    model_path = sys.argv[1] if len(sys.argv) > 1 else "./ckpts/Qwen2.5-Omni-7B-GPTQ-Int4"
+    print(f"\nLoading processor from {model_path} for modality ablation test...")
+    from transformers import Qwen2_5OmniProcessor
+    processor = Qwen2_5OmniProcessor.from_pretrained(model_path)
+
+    combos = [
+        ("text",),
+        ("audio",),
+        ("video",),
+        ("text", "audio"),
+        ("text", "video"),
+        ("audio", "video"),
+        ("text", "audio", "video"),
+    ]
+
+    print(f"\n{'modalities':<25} | {'seq_len':>7} | {'has_video_kv':>12} | {'has_audio_kv':>12}")
+    print("-" * 70)
+
+    fingerprints = {}
+    for mods in combos:
+        ds = CorruptedMELDDataset(
+            MELD_ROOT,
+            processor=processor,
+            split="test",
+            modalities=mods,
+            corrupt=True,
+            corruption_preset="medium",
+            for_training=False,
+        )
+        out = ds[0]
+        seq_len = out["input_ids"].shape[-1]
+        has_v = "pixel_values_videos" in out
+        has_a = "input_features" in out
+        ids_sig = int(out["input_ids"].sum().item())
+        v_sig = int(out["pixel_values_videos"].float().sum().item()) if has_v else None
+        a_sig = int(out["input_features"].float().sum().item()) if has_a else None
+        fingerprints["+".join(mods)] = (ids_sig, v_sig, a_sig)
+        print(f"{'+'.join(mods):<25} | {seq_len:>7} | {str(has_v):>12} | {str(has_a):>12}")
+
+    print("\nSanity checks (all should be True):")
+    print(f"    text-only has no video kv:        {fingerprints['text'][1] is None}")
+    print(f"  text-only has no audio kv:        {fingerprints['text'][2] is None}")
+    print(f"  audio-only has no video kv:       {fingerprints['audio'][1] is None}")
+    print(f"  video-only has no audio kv:       {fingerprints['video'][2] is None}")
+    print(f"  audio+video has both kv:          "
+          f"{fingerprints['audio+video'][1] is not None and fingerprints['audio+video'][2] is not None}")
+    print(f"  video != audio+video:             {fingerprints['video'] != fingerprints['audio+video']}")
+    print(f"  text+video != text+audio+video:   "
+          f"{fingerprints['text+video'] != fingerprints['text+audio+video']}")

@@ -1,8 +1,8 @@
 #!/bin/bash
-# Submit clean (no-corruption) eval jobs for every modality combo, for both base and finetuned models.
+# Submit medium-corruption eval jobs for every modality combo, for both base and finetuned models.
 #
 # Usage:
-#   ./scripts/submit_eval_clean_all.sh                # MELD test split, no corruption
+#   ./scripts/submit_eval_clean_all.sh                # MELD test split, medium corruption
 #   ./scripts/submit_eval_clean_all.sh --split dev    # forward extra args to the eval script
 #
 # Any args you pass are forwarded through sbatch -> the eval script.
@@ -34,8 +34,8 @@ FINETUNED_COMBOS=(
     "text audio video"
 )
 
-BASE_SBATCH="scripts/run_eval_base_clean.sbatch"
-FINETUNED_SBATCH="scripts/run_eval_finetune_clean.sbatch"
+BASE_SBATCH="scripts/run_eval_base_corruption.sbatch"
+FINETUNED_SBATCH="scripts/run_eval_finetune_corruption.sbatch"
 
 EXTRA_ARGS=("$@")
 
@@ -44,11 +44,12 @@ submit_combo() {
     local sbatch_script="$2"
     local combo="$3"
     # shellcheck disable=SC2086
-    echo "Submitting: model=${name} clean modalities='${combo}'"
+    echo "Submitting: model=${name} corruption=medium modalities='${combo}'"
     sbatch \
-        --job-name="eval_clean_${name}_${combo// /+}" \
+        --job-name="eval_corrupt_medium_${name}_${combo// /+}" \
         "$sbatch_script" \
         "${EXTRA_ARGS[@]}" \
+        --corruption_preset strong \
         --output_dir results/meld \
         --modalities $combo
 }

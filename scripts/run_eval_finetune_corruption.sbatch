@@ -21,6 +21,6 @@ cd $SLURM_SUBMIT_DIR
 source ./.venv-qwen/bin/activate
 module load ffmpeg
 uv run python -m src.evaluate.evaluate_corruption \
-    --adapter_path ./ckpts/finetuned_base/lora_adapter \
+    --adapter_path ./ckpts/finetuned_distill_clean_teacher_base_lk0.03/lora_adapter \
     --modalities text audio video \
     "$@"

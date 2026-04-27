@@ -19,6 +19,7 @@ Then point training at it:
 """
 
 import argparse
+import random
 import warnings
 from functools import partial
 from pathlib import Path
@@ -26,15 +27,16 @@ from pathlib import Path
 warnings.filterwarnings("ignore")
 
 import torch
+import numpy as np
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-from transformers import Qwen2_5OmniForConditionalGeneration, Qwen2_5OmniProcessor
+from transformers import Qwen2_5OmniForConditionalGeneration, Qwen2_5OmniProcessor, set_seed
 from peft import PeftModel
 
 import optimum.gptq.constants
 optimum.gptq.constants.BLOCK_PATTERNS.insert(0, "thinker.model.layers")
 
-from src.meld_dataset import CorruptedMELDDataset, collate_fn
+from src.meld_dataset import CORRUPTION_PRESET_NAMES, CorruptedMELDDataset, collate_fn
 
 
 def parse_args():
@@ -49,24 +51,41 @@ def parse_args():
                    help="LoRA adapter to load on top of the base thinker")
     p.add_argument("--base_teacher", action="store_true", default=False,
                    help="Use the base model with no adapter as teacher")
+    p.add_argument("--corrupt", action="store_true", default=False,
+                   help="Apply input corruption before teacher forward")
+    p.add_argument("--no_corrupt", dest="corrupt", action="store_false",
+                   help="Disable input corruption before teacher forward")
+    p.add_argument("--corruption_preset", default="medium",
+                   choices=CORRUPTION_PRESET_NAMES,
+                   help="Corruption preset to use when --corrupt is enabled")
     p.add_argument("--output_dir", required=True,
                    help="Where to write per-sample logits "
                         "(structured as {output_dir}/{split}/sample_{idx:06d}.pt)")
     p.add_argument("--num_workers", type=int, default=4)
+    p.add_argument("--seed", type=int, default=42,
+                   help="Random seed for python, numpy, torch, and dataloader workers")
     p.add_argument("--force", action="store_true", default=False,
                    help="Recompute even if a cache file already exists")
     return p.parse_args()
 
 
+def seed_worker(worker_id):
+    worker_seed = torch.initial_seed() % 2**32
+    random.seed(worker_seed)
+    np.random.seed(worker_seed)
+
+
 def main():
     args = parse_args()
+    set_seed(args.seed)
     if args.teacher_adapter_path is None and not args.base_teacher:
         raise SystemExit("Specify either --teacher_adapter_path or --base_teacher")
 
     print(
         f"Precomputing teacher logits | modalities={args.modalities} "
         f"splits={args.splits} adapter={args.teacher_adapter_path} "
-        f"base_teacher={args.base_teacher}"
+        f"base_teacher={args.base_teacher} corrupt={args.corrupt} "
+        f"corruption_preset={args.corruption_preset} seed={args.seed}"
     )
 
     processor = Qwen2_5OmniProcessor.from_pretrained(args.model_path)
@@ -93,15 +112,19 @@ def main():
             processor=processor,
             split=split,
             modalities=tuple(args.modalities),
-            corrupt=False,
+            corrupt=args.corrupt,
+            corruption_preset=args.corruption_preset,
             for_training=True,
             distill=False,
         )
+        generator = torch.Generator().manual_seed(args.seed)
         loader = DataLoader(
             dataset,
             batch_size=1,
             shuffle=False,
             num_workers=args.num_workers,
+            worker_init_fn=seed_worker,
+            generator=generator,
             collate_fn=partial(
                 collate_fn,
                 pad_token_id=processor.tokenizer.pad_token_id,

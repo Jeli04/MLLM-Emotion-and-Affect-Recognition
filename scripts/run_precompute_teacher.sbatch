@@ -10,6 +10,10 @@
 #SBATCH --output=slurm_logs/%j.out
 #SBATCH --error=slurm_logs/%j.err
 
+set -euo pipefail
+
+mkdir -p slurm_logs
+
 module purge
 module load gcc/13.3.0
 module load cuda/12.4.0
@@ -18,13 +22,21 @@ module load ffmpeg
 export PATH="$HOME/.local/bin:$PATH"
 
 cd $SLURM_SUBMIT_DIR
-source .venv/bin/activate
+source ./.venv/bin/activate
 
-# Precompute base-teacher logits for all three modalities.
-# Override --teacher_adapter_path / --base_teacher / --output_dir / etc. via "$@".
-PYTHONPATH=. uv run --active --no-sync python scripts/precompute_teacher_logits.py \
+# Precompute clean base-teacher logits for all three modalities.
+# Override --corrupt / --corruption_preset / --output_dir / etc. via "$@".
+PYTHONPATH=. python scripts/precompute_teacher_logits.py \
     --modalities text audio video \
     --splits train dev \
-    --teacher_adapter_path  /project2/robinjia_875/lijc/MLLM-Emotion-and-Affect-Recognition/ckpts/finetuned_base/lora_adapter/ \
-    --output_dir ./cache/teacher_logits/finetuned_t+a+v \
+    --base_teacher \
+    --no_corrupt \
+    --corruption_preset medium \
+    --output_dir ./cache/teacher_medium_logits/base_t+a+v \
     "$@"
+# PYTHONPATH=. python scripts/precompute_teacher_logits.py \
+#     --modalities text audio video \
+#     --splits train dev \
+#     --teacher_adapter_path  /project2/robinjia_875/lijc/MLLM-Emotion-and-Affect-Recognition/ckpts/finetuned_base/lora_adapter/ \
+#     --output_dir ./cache/teacher_logits/finetuned_t+a+v \
+#     "$@"

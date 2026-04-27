@@ -4,7 +4,7 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
-#SBATCH --mem=40G
+#SBATCH --mem=120G
 #SBATCH --gres=gpu:1
 #SBATCH --time=2-00:00:00
 #SBATCH --output=slurm_logs/%j.out
@@ -20,7 +20,8 @@ cd $SLURM_SUBMIT_DIR
 
 source ./.venv/bin/activate
 module load ffmpeg
-PYTHONPATH=. python src/finetune.py \
+PYTHONPATH=. python -m src.evaluate.evaluate_corruption \
+    --adapter_path ./ckpts/finetuned_base/lora_adapter \
+    --run_label finetune \
     --modalities text audio video \
-    --corruption_preset medium \
     "$@"

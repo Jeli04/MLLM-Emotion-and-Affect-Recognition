@@ -3,12 +3,15 @@ import json
 import logging
 import os
 import warnings
+from functools import partial
 
 warnings.filterwarnings("ignore")
 logging.getLogger("root").setLevel(logging.ERROR)
 
-from transformers import Qwen2_5OmniForConditionalGeneration, Qwen2_5OmniProcessor
+from transformers import Qwen2_5OmniForConditionalGeneration, Qwen2_5OmniProcessor, set_seed
+from peft import PeftModel
 import torch
+from torch.utils.data import DataLoader
 from tqdm import tqdm
 from sklearn.metrics import (
     classification_report, accuracy_score,
@@ -20,16 +23,15 @@ from sklearn.preprocessing import label_binarize
 import optimum.gptq.constants
 optimum.gptq.constants.BLOCK_PATTERNS.insert(0, "thinker.model.layers")
 
-from src.meld_dataset import RawMELDDataset, EMOTION2ID
+from src.meld_dataset import (
+    CORRUPTION_PRESET_NAMES,
+    CorruptedMELDDataset,
+    collate_fn,
+    EMOTION2ID,
+)
 
 ID2EMOTION = {v: k for k, v in EMOTION2ID.items()}
 VALID_EMOTIONS = set(EMOTION2ID.keys())
-
-SYSTEM_PROMPT = (
-    "Your job as a helpful assistant is to detect what emotion is being expressed "
-    "from the inputs. Output only one word. Here are the options: "
-    "anger, disgust, fear, joy, neutral, sadness, surprise."
-)
 
 
 def parse_args():
@@ -43,78 +45,99 @@ def parse_args():
                         help="Path to MELD.Raw directory")
     parser.add_argument("--model_path", default="./ckpts/Qwen2.5-Omni-7B-GPTQ-Int4",
                         help="Path to the model")
+    parser.add_argument("--adapter_path", default=None,
+                        help="Path to a LoRA adapter checkpoint to load on top of the base model")
+    parser.add_argument("--run_label", default=None,
+                        help="Tag for the saved-results filename (e.g. 'finetune', 'student_teacher'). "
+                             "Overrides the default 'base'/'finetuned' tag so different adapters don't collide.")
+    parser.add_argument("--corrupt", dest="corrupt", action="store_true", default=True,
+                        help="Apply noise/corruption to inputs (default: True)")
+    parser.add_argument("--no_corrupt", dest="corrupt", action="store_false",
+                        help="Disable input corruption")
+    parser.add_argument("--corruption_preset", default="medium",
+                        choices=CORRUPTION_PRESET_NAMES,
+                        help="Corruption preset to use when corruption is enabled")
+    parser.add_argument("--output_dir", default=os.path.join("results", "meld"),
+                        help="Directory where MELD corruption results are saved")
+    parser.add_argument("--seed", type=int, default=42,
+                        help="Random seed for python/numpy/torch (controls corruption RNG)")
     return parser.parse_args()
 
 
-def build_messages(sample, modalities):
-    """Build chat messages based on enabled modalities.
-
-    When video is enabled, audio is extracted from the video via
-    use_audio_in_video=True, so we skip adding a separate audio entry.
-    A standalone audio entry is only added when audio is requested without video.
-    """
-    user_content = []
-    has_video = "video" in modalities
-    for mod in modalities:
-        if mod == "text":
-            user_content.append({"type": "text", "text": sample["text"]})
-        elif mod == "video":
-            user_content.append({"type": "video", "video": sample["video_path"]})
-        elif mod == "audio" and not has_video:
-            user_content.append({"type": "audio", "audio": sample["video_path"]})
-
-    messages = [
-        {
-            "role": "system",
-            "content": [{"type": "text", "text": SYSTEM_PROMPT}],
-        },
-        {
-            "role": "user",
-            "content": user_content,
-        },
-    ]
-    return messages
+def eval_collate(batch, pad_token_id):
+    """Collate wrapper that extracts non-tensor metadata before calling collate_fn."""
+    emotions = [b["emotion"] for b in batch]
+    tensor_batch = [{k: v for k, v in b.items() if k not in ("emotion", "label")} for b in batch]
+    collated = collate_fn(tensor_batch, pad_token_id=pad_token_id, padding_side="left")
+    collated["emotions"] = emotions
+    return collated
 
 
 def main():
     args = parse_args()
-    print(f"Evaluating on split='{args.split}' with modalities={args.modalities}")
+    set_seed(args.seed)
+    print(
+        f"Evaluating on split='{args.split}' with modalities={args.modalities}, "
+        f"corrupt={args.corrupt}, corruption_preset={args.corruption_preset}, "
+        f"seed={args.seed}"
+    )
 
-    dataset = RawMELDDataset(args.data_root, split=args.split, load_audio=False)
-
-    # Load model
     processor = Qwen2_5OmniProcessor.from_pretrained(args.model_path)
     model = Qwen2_5OmniForConditionalGeneration.from_pretrained(
         args.model_path,
         device_map="auto",
+        enable_audio_output=False,
+    )
+    if args.adapter_path is not None:
+        print(f"Loading LoRA adapter from {args.adapter_path}...")
+        model.thinker = PeftModel.from_pretrained(model.thinker, args.adapter_path)
+
+    model.eval()
+
+    first_device = next(model.parameters()).device
+
+    dataset = CorruptedMELDDataset(
+        args.data_root,
+        processor=processor,
+        split=args.split,
+        modalities=tuple(args.modalities),
+        corrupt=args.corrupt,
+        corruption_preset=args.corruption_preset,
+        for_training=False,
+    )
+
+    loader = DataLoader(
+        dataset,
+        batch_size=1,
+        shuffle=False,
+        collate_fn=partial(eval_collate, pad_token_id=processor.tokenizer.pad_token_id),
+        num_workers=0,
     )
 
     all_preds = []
     all_labels = []
-    invalid_predictions = []  # (index, model_output, ground_truth)
-    skipped_samples = []  # (index, error_message, ground_truth)
+    invalid_predictions = []
+    skipped_samples = []
     per_sample_results = []
 
-    for i, sample in enumerate(tqdm(dataset, desc="Evaluating")):
-        gt_emotion = sample["emotion"]
-        messages = build_messages(sample, args.modalities)
+    for i, batch in enumerate(tqdm(loader, desc="Evaluating")):
+        gt_emotion = batch.pop("emotions")[0]
+        raw_sample = dataset.raw_dataset[i]
+
+        inputs = {
+            k: v.to(first_device) if isinstance(v, torch.Tensor) else v
+            for k, v in batch.items()
+        }
 
         try:
-            use_audio = "video" in args.modalities or "audio" in args.modalities
-            inputs = processor.apply_chat_template(
-                messages,
-                tokenize=True,
-                add_generation_prompt=True,
-                load_audio_from_video=("video" in args.modalities),
-                use_audio_in_video=("video" in args.modalities),
-                fps=1,
-                padding=True,
-                return_dict=True,
-                return_tensors="pt",
-            )
-            inputs = {k: v.to(model.device) for k, v in inputs.items()}
-
-            text_ids = model.generate(**inputs, max_new_tokens=128, return_audio=False)
+            with torch.no_grad():
+                text_ids = model.generate(
+                    **inputs,
+                    max_new_tokens=128,
+                    do_sample=False,
+                    return_audio=False,
+                    use_audio_in_video=False,
+                )
 
             generated_ids_trimmed = [
                 out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs["input_ids"], text_ids)
@@ -128,9 +151,9 @@ def main():
             skipped_samples.append((i, str(e), gt_emotion))
             per_sample_results.append({
                 "sample_index": i,
-                "dialogue_id": sample["dialogue_id"],
-                "utterance_id": sample["utterance_id"],
-                "text": sample["text"],
+                "dialogue_id": raw_sample["dialogue_id"],
+                "utterance_id": raw_sample["utterance_id"],
+                "text": raw_sample["text"],
                 "ground_truth": gt_emotion,
                 "prediction": None,
                 "raw_model_output": None,
@@ -148,9 +171,9 @@ def main():
 
         per_sample_results.append({
             "sample_index": i,
-            "dialogue_id": sample["dialogue_id"],
-            "utterance_id": sample["utterance_id"],
-            "text": sample["text"],
+            "dialogue_id": raw_sample["dialogue_id"],
+            "utterance_id": raw_sample["utterance_id"],
+            "text": raw_sample["text"],
             "ground_truth": gt_emotion,
             "prediction": pred,
             "raw_model_output": raw_output,
@@ -168,7 +191,10 @@ def main():
     print("\n" + "=" * 60)
     print("RESULTS")
     print("=" * 60)
-    print(f"Split: {args.split} | Modalities: {args.modalities}")
+    print(
+        f"Split: {args.split} | Modalities: {args.modalities} | "
+        f"Corrupt: {args.corrupt} | Preset: {args.corruption_preset}"
+    )
     print(f"Total samples: {len(dataset)}")
     print(f"Valid predictions: {len(all_preds)}")
     print(f"Invalid predictions: {len(invalid_predictions)}")
@@ -186,7 +212,6 @@ def main():
         acc = accuracy_score(all_labels, all_preds)
         print(f"Accuracy: {acc:.4f}")
 
-        # Binary-style metrics via one-vs-rest binarization
         y_true_bin = label_binarize(all_labels, classes=label_names)
         y_pred_bin = label_binarize(all_preds, classes=label_names)
         auroc = roc_auc_score(y_true_bin, y_pred_bin, average="macro")
@@ -196,18 +221,21 @@ def main():
         print(f"Macro Avg Precision (AUPRC):  {auprc:.4f}")
         print(f"MCC:                          {mcc:.4f}")
 
-    # Peak VRAM
     peak_vram = torch.cuda.max_memory_allocated() / (1024 ** 3)
     print(f"\nPeak VRAM usage: {peak_vram:.2f} GB")
 
-    # Save results to JSON
     modalities_str = "+".join(sorted(args.modalities))
-    output_filename = f"results_{args.split}_{modalities_str}.json"
-    output_path = os.path.join("results", output_filename)
+    corrupt_str = f"corrupt_{args.corruption_preset}" if args.corrupt else "clean"
+    model_str = args.run_label or ("finetuned" if args.adapter_path else "base")
+    output_filename = f"results_{args.split}_{modalities_str}_{corrupt_str}_{model_str}.json"
+    output_path = os.path.join(args.output_dir, output_filename)
 
     results_json = {
         "split": args.split,
         "modalities": args.modalities,
+        "corrupt": args.corrupt,
+        "corruption_preset": args.corruption_preset,
+        "adapter_path": args.adapter_path,
         "total_samples": len(dataset),
         "valid_predictions": len(all_preds),
         "invalid_predictions": len(invalid_predictions),
@@ -227,6 +255,7 @@ def main():
         "predictions": per_sample_results,
     }
 
+    os.makedirs(args.output_dir, exist_ok=True)
     with open(output_path, "w") as f:
         json.dump(results_json, f, indent=2)
     print(f"\nResults saved to {output_path}")

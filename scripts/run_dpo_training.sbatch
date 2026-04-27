@@ -4,7 +4,7 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
-#SBATCH --mem=40G
+#SBATCH --mem=120G
 #SBATCH --gres=gpu:1
 #SBATCH --time=2-00:00:00
 #SBATCH --output=slurm_logs/%j.out
@@ -18,9 +18,9 @@ module load cuda/12.4.0
 
 cd $SLURM_SUBMIT_DIR
 
-source ./.venv/bin/activate
 module load ffmpeg
-PYTHONPATH=. python src/finetune.py \
+PYTHONPATH=. uv run --active --no-sync python -m src.dpo.dpo_training \
+    --dpo_data_path results/dpo/dpo_samples_train_audio+text+video_corrupt_finetuned.json \
+    --output_dir ./ckpts/dpo_finetuned \
     --modalities text audio video \
-    --corruption_preset medium \
     "$@"

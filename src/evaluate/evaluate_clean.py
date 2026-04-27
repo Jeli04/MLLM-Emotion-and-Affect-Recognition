@@ -73,6 +73,9 @@ def parse_args():
                         help="Path to the model")
     parser.add_argument("--adapter_path", default=None,
                         help="Path to a LoRA adapter checkpoint to load on top of the base model")
+    parser.add_argument("--run_label", default=None,
+                        help="Tag for the saved-results filename (e.g. 'finetune', 'student_teacher'). "
+                             "Overrides the default 'base'/'finetuned' tag so different adapters don't collide.")
     parser.add_argument(
         "--manifest",
         default=None,
@@ -346,7 +349,7 @@ def main():
 
     # Save results to JSON
     modalities_str = "+".join(sorted(args.modalities))
-    model_str = "finetuned" if args.adapter_path else "base"
+    model_str = args.run_label or ("finetuned" if args.adapter_path else "base")
     if args.dataset == "meld":
         output_filename = f"results_{args.split}_{modalities_str}_{model_str}.json"
         output_dir = args.output_dir or os.path.join("results", "meld")

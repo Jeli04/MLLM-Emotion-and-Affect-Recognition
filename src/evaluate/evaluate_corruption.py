@@ -47,6 +47,9 @@ def parse_args():
                         help="Path to the model")
     parser.add_argument("--adapter_path", default=None,
                         help="Path to a LoRA adapter checkpoint to load on top of the base model")
+    parser.add_argument("--run_label", default=None,
+                        help="Tag for the saved-results filename (e.g. 'finetune', 'student_teacher'). "
+                             "Overrides the default 'base'/'finetuned' tag so different adapters don't collide.")
     parser.add_argument("--corrupt", dest="corrupt", action="store_true", default=True,
                         help="Apply noise/corruption to inputs (default: True)")
     parser.add_argument("--no_corrupt", dest="corrupt", action="store_false",
@@ -223,7 +226,7 @@ def main():
 
     modalities_str = "+".join(sorted(args.modalities))
     corrupt_str = f"corrupt_{args.corruption_preset}" if args.corrupt else "clean"
-    model_str = "finetuned" if args.adapter_path else "base"
+    model_str = args.run_label or ("finetuned" if args.adapter_path else "base")
     output_filename = f"results_{args.split}_{modalities_str}_{corrupt_str}_{model_str}.json"
     output_path = os.path.join(args.output_dir, output_filename)
 

@@ -20,6 +20,8 @@ cd $SLURM_SUBMIT_DIR
 
 source ./.venv/bin/activate
 module load ffmpeg
-PYTHONPATH=. python -m src.evaluate.evaluate_corruption \
+PYTHONPATH=. python -m src.evaluate.evaluate_clean \
+    --adapter_path ./ckpts/finetuned_distill_clean_teacher_base_lk0.03/lora_adapter \
+    --run_label student_teacher_base \
     --modalities text audio video \
     "$@"

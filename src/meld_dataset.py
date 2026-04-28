@@ -37,6 +37,15 @@ SYSTEM_PROMPT = (
     "anger, disgust, fear, joy, neutral, sadness, surprise."
 )
 
+
+def _ensure_media_file(path):
+    path = Path(path)
+    if not path.is_file():
+        raise FileNotFoundError(f"Media file does not exist: {path}")
+    if path.stat().st_size == 0:
+        raise RuntimeError(f"Media file is empty: {path}")
+    return path
+
 CORRUPTION_AWARE_SYSTEM_PROMPT = (
     "Your job as a helpful assistant is to detect what emotion is being expressed "
     "from the inputs and identify which input modalities are corrupted. "
@@ -267,6 +276,7 @@ def load_video_frames(video_path, fps=1, temporal_patch_size=2):
     Rounds the frame count to a multiple of temporal_patch_size (2 for Qwen2.5-Omni).
     Returns a [N, H, W, C] uint8 numpy array.
     """
+    video_path = _ensure_media_file(video_path)
     vr = decord.VideoReader(str(video_path), num_threads=1)
     total_frames = len(vr)
     video_fps = vr.get_avg_fps()
@@ -279,6 +289,7 @@ def load_video_frames(video_path, fps=1, temporal_patch_size=2):
 
 def load_audio_from_video(path, target_sr=16000):
     """Decode mono audio from an mp4 using PyAV, resampled to target_sr."""
+    path = _ensure_media_file(path)
     with av.open(str(path)) as container:
         stream = next((s for s in container.streams if s.type == "audio"), None)
         if stream is None:

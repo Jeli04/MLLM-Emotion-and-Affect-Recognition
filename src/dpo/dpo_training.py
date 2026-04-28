@@ -1,4 +1,5 @@
 import argparse
+import faulthandler
 import json
 import logging
 import os
@@ -17,6 +18,8 @@ from transformers import (
     set_seed,
 )
 
+faulthandler.enable(all_threads=True)
+
 # prevents warning message from being displayed
 logging.getLogger().addFilter(
     lambda r: "System prompt modified" not in r.getMessage()
@@ -27,10 +30,13 @@ import optimum.gptq.constants
 optimum.gptq.constants.BLOCK_PATTERNS.insert(0, "thinker.model.layers")
 
 from src.meld_dataset import (
+    CORRUPTION_PRESET_NAMES,
     SYSTEM_PROMPT,
+    apply_audio_corruptions,
+    apply_video_corruptions,
     collate_fn,
-    corrupt_audio,
     corrupt_text,
+    get_corruption_config,
     load_audio_from_video,
     load_video_frames,
 )
@@ -70,6 +76,10 @@ def parse_args():
     parser.add_argument("--corrupt", action="store_true", default=True,
                         help="Apply the same random input corruption style used by supervised finetuning")
     parser.add_argument("--no_corrupt", dest="corrupt", action="store_false")
+    parser.add_argument("--corruption_preset", default=None,
+                        choices=CORRUPTION_PRESET_NAMES,
+                        help="Corruption preset to use when --corrupt is enabled. "
+                             "Defaults to the preset stored in the DPO JSON, or 'medium'.")
 
     # W&B args
     parser.add_argument("--wandb", dest="wandb", action="store_true", default=True,
@@ -101,10 +111,11 @@ class MELDDPODataset(Dataset):
         corrupt=True,
         audio_sr=16000,
         fps=1,
-        text_char_swap_prob=0.1,
-        text_word_drop_prob=0.1,
-        audio_noise_level=0.05,
-        video_noise_level=0.05,
+        corruption_preset=None,
+        text_char_swap_prob=None,
+        text_word_drop_prob=None,
+        audio_noise_level=None,
+        video_noise_level=None,
     ):
         self.dpo_data_path = Path(dpo_data_path)
         self.processor = processor
@@ -112,10 +123,6 @@ class MELDDPODataset(Dataset):
         self.corrupt = corrupt
         self.audio_sr = audio_sr
         self.fps = fps
-        self.text_char_swap_prob = text_char_swap_prob
-        self.text_word_drop_prob = text_word_drop_prob
-        self.audio_noise_level = audio_noise_level
-        self.video_noise_level = video_noise_level
 
         with open(self.dpo_data_path) as f:
             data = json.load(f)
@@ -124,18 +131,37 @@ class MELDDPODataset(Dataset):
         if not self.samples:
             raise ValueError(f"No DPO samples found in {self.dpo_data_path}")
 
+        data_preset = data.get("corruption_preset") if isinstance(data, dict) else None
+        sample_preset = next(
+            (
+                sample.get("corruption_preset")
+                for sample in self.samples
+                if isinstance(sample, dict) and sample.get("corruption_preset")
+            ),
+            None,
+        )
+        self.corruption_preset = corruption_preset or data_preset or sample_preset or "medium"
+        self.corruption_config = get_corruption_config(
+            self.corruption_preset,
+            text_char_swap_prob=text_char_swap_prob,
+            text_word_drop_prob=text_word_drop_prob,
+            audio_noise_level=audio_noise_level,
+            video_noise_level=video_noise_level,
+        )
+        self.text_char_swap_prob = self.corruption_config["text_char_swap_prob"]
+        self.text_word_drop_prob = self.corruption_config["text_word_drop_prob"]
+
     def __len__(self):
         return len(self.samples)
 
     def _build_prompt_messages(self, sample, text):
         user_content = []
-        has_video = "video" in self.modalities
         for mod in self.modalities:
             if mod == "text":
                 user_content.append({"type": "text", "text": text})
             elif mod == "video":
                 user_content.append({"type": "video", "video": sample["video_path"]})
-            elif mod == "audio" and not has_video:
+            elif mod == "audio":
                 user_content.append({"type": "audio", "audio": sample["video_path"]})
 
         return [
@@ -147,7 +173,7 @@ class MELDDPODataset(Dataset):
         videos = None
         audio = None
         has_video = "video" in self.modalities
-        has_audio = "audio" in self.modalities or has_video
+        has_audio = "audio" in self.modalities
 
         if has_video:
             try:
@@ -155,8 +181,7 @@ class MELDDPODataset(Dataset):
             except Exception:
                 frames = np.zeros((2, 224, 224, 3), dtype=np.uint8)
             if self.corrupt:
-                noise = np.random.randn(*frames.shape).astype(np.float32) * self.video_noise_level * 255
-                frames = np.clip(frames.astype(np.float32) + noise, 0, 255).astype(np.uint8)
+                frames = apply_video_corruptions(frames, self.corruption_config)
             videos = [frames]
 
         if has_audio:
@@ -165,13 +190,17 @@ class MELDDPODataset(Dataset):
             except Exception:
                 waveform = np.zeros(self.audio_sr, dtype=np.float32)
             if self.corrupt:
-                waveform = corrupt_audio(waveform, noise_level=self.audio_noise_level)
+                waveform = apply_audio_corruptions(
+                    waveform,
+                    sample_rate=self.audio_sr,
+                    config=self.corruption_config,
+                )
             audio = [waveform]
 
         return dict(
             videos=videos,
             audio=audio,
-            use_audio_in_video=has_video and has_audio,
+            use_audio_in_video=False,
             fps=self.fps,
             do_sample_frames=False,
             padding=True,
@@ -266,19 +295,30 @@ class PreferenceTrainer(Trainer):
         shifted_logits = logits[:, :-1, :]
         shifted_labels = labels[:, 1:].clone()
         loss_mask = shifted_labels != -100
-        shifted_labels[shifted_labels == -100] = 0
 
-        per_token_logps = torch.gather(
-            shifted_logits.log_softmax(-1),
-            dim=2,
-            index=shifted_labels.unsqueeze(2),
-        ).squeeze(2)
-        return (per_token_logps * loss_mask).sum(dim=-1)
+        if not loss_mask.any():
+            return logits.new_zeros(labels.size(0))
+
+        selected_logits = shifted_logits[loss_mask].float()
+        selected_labels = shifted_labels[loss_mask]
+        token_logps = (
+            selected_logits.gather(1, selected_labels.unsqueeze(1)).squeeze(1)
+            - selected_logits.logsumexp(dim=-1)
+        )
+
+        batch_indices = loss_mask.nonzero(as_tuple=True)[0]
+        batch_logps = token_logps.new_zeros(labels.size(0))
+        batch_logps.index_add_(0, batch_indices, token_logps)
+        return batch_logps
 
     def _forward_logps(self, model, batch):
         labels = batch["labels"]
         model_inputs = {key: value for key, value in batch.items() if key != "labels"}
-        outputs = model(**model_inputs)
+        # Bypass Accelerate's ConvertOutputsToFp32 wrapper. DPO only needs
+        # response-token logprobs, so casting the full [B, T, V] logits tensor
+        # to fp32 can OOM before we get a chance to slice it down.
+        inner_forward = getattr(model.forward, "model_forward", model.forward)
+        outputs = inner_forward(**model_inputs)
         logits = outputs.logits if hasattr(outputs, "logits") else outputs[0]
         return self._get_batch_logps(logits, labels)
 
@@ -331,7 +371,8 @@ def main():
     set_seed(args.seed)
     print(
         f"DPO training with data={args.dpo_data_path}, modalities={args.modalities}, "
-        f"corrupt={args.corrupt}, beta={args.beta}, wandb={args.wandb}, seed={args.seed}"
+        f"corrupt={args.corrupt}, corruption_preset={args.corruption_preset or 'from_data_or_medium'}, "
+        f"beta={args.beta}, wandb={args.wandb}, seed={args.seed}"
     )
 
     if args.wandb:
@@ -376,7 +417,9 @@ def main():
         processor=processor,
         modalities=tuple(args.modalities),
         corrupt=args.corrupt,
+        corruption_preset=args.corruption_preset,
     )
+    print(f"Resolved DPO corruption_preset={dataset.corruption_preset}")
     train_dataset, eval_dataset = maybe_split_dataset(dataset, args.eval_ratio, args.seed)
 
     run_name = args.wandb_run_name or os.path.basename(os.path.abspath(args.output_dir))

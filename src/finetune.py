@@ -1,4 +1,5 @@
 import argparse
+import faulthandler
 import logging
 import os
 from functools import partial
@@ -12,7 +13,10 @@ from transformers import (
     Trainer,
     set_seed,
 )
+from transformers.trainer_utils import get_last_checkpoint
 from peft import LoraConfig, get_peft_model, TaskType
+
+faulthandler.enable(all_threads=True)
 
 # prevents warning message from being displayed
 logging.getLogger().addFilter(
@@ -51,6 +55,10 @@ def parse_args():
     parser.add_argument("--lora_dropout", type=float, default=0.05)
     parser.add_argument("--logging_steps", type=int, default=10)
     parser.add_argument("--save_steps", type=int, default=200)
+    parser.add_argument("--resume_from_checkpoint", type=str, default=None,
+                        help="Path to a checkpoint dir to resume from. Pass "
+                             "'true', 'latest', or 'auto' to use the latest "
+                             "checkpoint in output_dir.")
     parser.add_argument("--corrupt", action="store_true", default=True,
                         help="Apply noise/corruption to raw inputs")
     parser.add_argument("--no_corrupt", dest="corrupt", action="store_false")
@@ -75,6 +83,33 @@ def parse_args():
                         help="Optional W&B run name")
 
     return parser.parse_args()
+
+
+def resolve_resume_from_checkpoint(resume_from_checkpoint, output_dir):
+    if resume_from_checkpoint is None:
+        return None
+
+    value = resume_from_checkpoint.strip()
+    lower = value.lower()
+    if lower in {"false", "0", "no", "none"}:
+        return None
+
+    if lower in {"true", "1", "yes", "latest", "auto"}:
+        checkpoint = get_last_checkpoint(output_dir)
+        if checkpoint is None:
+            raise ValueError(
+                "--resume_from_checkpoint requested auto-resume, but no "
+                f"checkpoint-* directory was found in {output_dir!r}."
+            )
+        print(f"Resuming from latest checkpoint: {checkpoint}")
+        return checkpoint
+
+    if not os.path.isdir(value):
+        raise ValueError(
+            f"--resume_from_checkpoint points to a missing directory: {value}"
+        )
+    print(f"Resuming from checkpoint: {value}")
+    return value
 
 
 def _unwrap_logits(logits, labels):
@@ -259,7 +294,11 @@ def main():
         preprocess_logits_for_metrics=preprocess_logits_for_metrics,
     )
 
-    trainer.train()
+    resume_from_checkpoint = resolve_resume_from_checkpoint(
+        args.resume_from_checkpoint,
+        args.output_dir,
+    )
+    trainer.train(resume_from_checkpoint=resume_from_checkpoint)
 
     adapter_dir = os.path.join(args.output_dir, "lora_adapter")
     thinker.save_pretrained(adapter_dir)

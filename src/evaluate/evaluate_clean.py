@@ -14,8 +14,12 @@ from peft import PeftModel
 import torch
 from tqdm import tqdm
 from sklearn.metrics import (
-    classification_report, accuracy_score,
-    roc_auc_score, average_precision_score, matthews_corrcoef,
+    classification_report,
+    accuracy_score,
+    f1_score,
+    roc_auc_score,
+    average_precision_score,
+    matthews_corrcoef,
 )
 from sklearn.preprocessing import label_binarize
 
@@ -23,7 +27,12 @@ from sklearn.preprocessing import label_binarize
 import optimum.gptq.constants
 optimum.gptq.constants.BLOCK_PATTERNS.insert(0, "thinker.model.layers")
 
-from src.meld_dataset import RawMELDDataset, EMOTION2ID
+from src.meld_dataset import (
+    CORRUPTION_PRESET_NAMES,
+    RawMELDDataset,
+    EMOTION2ID,
+    load_audio_from_video,
+)
 
 MELD_VALID_EMOTIONS = set(EMOTION2ID.keys())
 MELD_SYSTEM_PROMPT = (
@@ -76,6 +85,10 @@ def parse_args():
     parser.add_argument("--run_label", default=None,
                         help="Tag for the saved-results filename (e.g. 'finetune', 'student_teacher'). "
                              "Overrides the default 'base'/'finetuned' tag so different adapters don't collide.")
+    parser.add_argument("--corruption_preset", default="medium",
+                        choices=CORRUPTION_PRESET_NAMES,
+                        help="Corruption preset label to record for compatibility with corruption eval jobs. "
+                             "Clean evaluation does not apply corruption.")
     parser.add_argument(
         "--manifest",
         default=None,
@@ -118,7 +131,7 @@ def _resolve_iemocap_media_path(raw_path: str, iemocap_root: Path) -> str:
         parts = path.parts
         for i, part in enumerate(parts):
             if part == "IEMOCAP_full_release" and i + 1 < len(parts):
-                cand = iemocap_root / Path(*parts[i + 1 :])
+                cand = iemocap_root / Path(*parts[i + 1:])
                 if cand.is_file():
                     return str(cand.resolve())
                 break
@@ -166,23 +179,24 @@ def load_iemocap_manifest(manifest_path, split=None, sessions=None, max_samples=
     return rows
 
 
-def build_messages(sample, modalities, system_prompt):
+def build_messages(sample, modalities, system_prompt, audio_sr=16000):
     """Build chat messages based on enabled modalities.
 
-    When video is enabled, audio is extracted from the video via
-    use_audio_in_video=True, so we skip adding a separate audio entry.
-    A standalone audio entry is only added when audio is requested without video.
+    Audio is pre-decoded with PyAV (load_audio_from_video) to match the
+    CorruptedMELDDataset pipeline; otherwise the processor would route through
+    librosa/audioread, which returns a waveform with different (typically
+    smaller) amplitude for the same clip.
     """
     user_content = []
-    has_video = "video" in modalities
     for mod in modalities:
         if mod == "text":
             user_content.append({"type": "text", "text": sample["text"]})
         elif mod == "video":
             user_content.append({"type": "video", "video": sample["video_path"]})
-        elif mod == "audio" and not has_video:
+        elif mod == "audio":
             audio_source = sample.get("audio_path") or sample["video_path"]
-            user_content.append({"type": "audio", "audio": audio_source})
+            waveform, _ = load_audio_from_video(audio_source, target_sr=audio_sr)
+            user_content.append({"type": "audio", "audio": waveform})
 
     messages = [
         {
@@ -202,7 +216,7 @@ def main():
     set_seed(args.seed)
     print(
         f"Evaluating dataset='{args.dataset}' split='{args.split}' with modalities={args.modalities}, "
-        f"seed={args.seed}"
+        f"corruption_preset={args.corruption_preset}, seed={args.seed}"
     )
 
     if args.dataset == "meld":
@@ -249,8 +263,8 @@ def main():
                 messages,
                 tokenize=True,
                 add_generation_prompt=True,
-                load_audio_from_video=("video" in args.modalities),
-                use_audio_in_video=("video" in args.modalities),
+                load_audio_from_video=False,
+                use_audio_in_video=False,
                 fps=1,
                 padding=True,
                 return_dict=True,
@@ -315,7 +329,10 @@ def main():
     print("\n" + "=" * 60)
     print("RESULTS")
     print("=" * 60)
-    print(f"Split: {args.split} | Modalities: {args.modalities}")
+    print(
+        f"Split: {args.split} | Modalities: {args.modalities} | "
+        f"Corruption preset arg: {args.corruption_preset}"
+    )
     print(f"Total samples: {len(dataset)}")
     print(f"Valid predictions: {len(all_preds)}")
     print(f"Invalid predictions: {len(invalid_predictions)}")
@@ -326,12 +343,38 @@ def main():
         for idx, model_out, gt in invalid_predictions:
             print(f"  Sample {idx}: model='{model_out}' | gt='{gt}'")
 
+    label_names = sorted(valid_emotions)
+
+    acc = None
+    macro_f1 = None
+    weighted_f1 = None
+    auroc = None
+    auprc = None
+    mcc = None
+
     if all_preds:
-        label_names = sorted(valid_emotions)
         print("\n--- Classification Report ---")
         print(classification_report(all_labels, all_preds, labels=label_names, zero_division=0))
+
         acc = accuracy_score(all_labels, all_preds)
-        print(f"Accuracy: {acc:.4f}")
+        macro_f1 = f1_score(
+            all_labels,
+            all_preds,
+            labels=label_names,
+            average="macro",
+            zero_division=0,
+        )
+        weighted_f1 = f1_score(
+            all_labels,
+            all_preds,
+            labels=label_names,
+            average="weighted",
+            zero_division=0,
+        )
+
+        print(f"Accuracy:                     {acc:.4f}")
+        print(f"Macro F1:                     {macro_f1:.4f}")
+        print(f"Weighted F1:                  {weighted_f1:.4f}")
 
         # Binary-style metrics via one-vs-rest binarization
         y_true_bin = label_binarize(all_labels, classes=label_names)
@@ -339,6 +382,7 @@ def main():
         auroc = roc_auc_score(y_true_bin, y_pred_bin, average="macro")
         auprc = average_precision_score(y_true_bin, y_pred_bin, average="macro")
         mcc = matthews_corrcoef(all_labels, all_preds)
+
         print(f"Macro AUROC (OVR):            {auroc:.4f}")
         print(f"Macro Avg Precision (AUPRC):  {auprc:.4f}")
         print(f"MCC:                          {mcc:.4f}")
@@ -362,23 +406,18 @@ def main():
         "dataset": args.dataset,
         "split": args.split,
         "modalities": args.modalities,
+        "corruption_preset": args.corruption_preset,
         "adapter_path": args.adapter_path,
         "total_samples": len(dataset),
         "valid_predictions": len(all_preds),
         "invalid_predictions": len(invalid_predictions),
         "skipped_samples": len(skipped_samples),
-        "accuracy": accuracy_score(all_labels, all_preds) if all_preds else None,
-        "auroc_macro_ovr": roc_auc_score(
-            label_binarize(all_labels, classes=sorted(valid_emotions)),
-            label_binarize(all_preds, classes=sorted(valid_emotions)),
-            average="macro",
-        ) if all_preds else None,
-        "auprc_macro_ovr": average_precision_score(
-            label_binarize(all_labels, classes=sorted(valid_emotions)),
-            label_binarize(all_preds, classes=sorted(valid_emotions)),
-            average="macro",
-        ) if all_preds else None,
-        "mcc": matthews_corrcoef(all_labels, all_preds) if all_preds else None,
+        "accuracy": acc,
+        "macro_f1": macro_f1,
+        "weighted_f1": weighted_f1,
+        "auroc_macro_ovr": auroc,
+        "auprc_macro_ovr": auprc,
+        "mcc": mcc,
         "predictions": per_sample_results,
     }
 

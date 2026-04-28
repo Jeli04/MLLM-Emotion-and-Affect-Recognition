@@ -14,8 +14,12 @@ import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 from sklearn.metrics import (
-    classification_report, accuracy_score,
-    roc_auc_score, average_precision_score, matthews_corrcoef,
+    classification_report,
+    accuracy_score,
+    f1_score,
+    roc_auc_score,
+    average_precision_score,
+    matthews_corrcoef,
 )
 from sklearn.preprocessing import label_binarize
 
@@ -205,18 +209,45 @@ def main():
         for idx, model_out, gt in invalid_predictions:
             print(f"  Sample {idx}: model='{model_out}' | gt='{gt}'")
 
+    label_names = sorted(VALID_EMOTIONS)
+
+    acc = None
+    macro_f1 = None
+    weighted_f1 = None
+    auroc = None
+    auprc = None
+    mcc = None
+
     if all_preds:
-        label_names = sorted(VALID_EMOTIONS)
         print("\n--- Classification Report ---")
         print(classification_report(all_labels, all_preds, labels=label_names, zero_division=0))
+
         acc = accuracy_score(all_labels, all_preds)
-        print(f"Accuracy: {acc:.4f}")
+        macro_f1 = f1_score(
+            all_labels,
+            all_preds,
+            labels=label_names,
+            average="macro",
+            zero_division=0,
+        )
+        weighted_f1 = f1_score(
+            all_labels,
+            all_preds,
+            labels=label_names,
+            average="weighted",
+            zero_division=0,
+        )
+
+        print(f"Accuracy:                     {acc:.4f}")
+        print(f"Macro F1:                     {macro_f1:.4f}")
+        print(f"Weighted F1:                  {weighted_f1:.4f}")
 
         y_true_bin = label_binarize(all_labels, classes=label_names)
         y_pred_bin = label_binarize(all_preds, classes=label_names)
         auroc = roc_auc_score(y_true_bin, y_pred_bin, average="macro")
         auprc = average_precision_score(y_true_bin, y_pred_bin, average="macro")
         mcc = matthews_corrcoef(all_labels, all_preds)
+
         print(f"Macro AUROC (OVR):            {auroc:.4f}")
         print(f"Macro Avg Precision (AUPRC):  {auprc:.4f}")
         print(f"MCC:                          {mcc:.4f}")
@@ -240,18 +271,12 @@ def main():
         "valid_predictions": len(all_preds),
         "invalid_predictions": len(invalid_predictions),
         "skipped_samples": len(skipped_samples),
-        "accuracy": accuracy_score(all_labels, all_preds) if all_preds else None,
-        "auroc_macro_ovr": roc_auc_score(
-            label_binarize(all_labels, classes=sorted(VALID_EMOTIONS)),
-            label_binarize(all_preds, classes=sorted(VALID_EMOTIONS)),
-            average="macro",
-        ) if all_preds else None,
-        "auprc_macro_ovr": average_precision_score(
-            label_binarize(all_labels, classes=sorted(VALID_EMOTIONS)),
-            label_binarize(all_preds, classes=sorted(VALID_EMOTIONS)),
-            average="macro",
-        ) if all_preds else None,
-        "mcc": matthews_corrcoef(all_labels, all_preds) if all_preds else None,
+        "accuracy": acc,
+        "macro_f1": macro_f1,
+        "weighted_f1": weighted_f1,
+        "auroc_macro_ovr": auroc,
+        "auprc_macro_ovr": auprc,
+        "mcc": mcc,
         "predictions": per_sample_results,
     }
 

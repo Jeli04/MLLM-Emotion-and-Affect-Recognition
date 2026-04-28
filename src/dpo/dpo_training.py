@@ -80,6 +80,18 @@ def parse_args():
                         choices=CORRUPTION_PRESET_NAMES,
                         help="Corruption preset to use when --corrupt is enabled. "
                              "Defaults to the preset stored in the DPO JSON, or 'medium'.")
+    parser.add_argument("--max_audio_seconds", type=float, default=20.0,
+                        help="Cap each DPO audio clip to this many seconds to avoid "
+                             "rare long-sample OOMs. Use <=0 to disable.")
+    parser.add_argument("--max_video_frames", type=int, default=16,
+                        help="Uniformly downsample each DPO video clip to at most this "
+                             "many frames. Use <=0 to disable.")
+    parser.add_argument("--torch_empty_cache_steps", type=int, default=1,
+                        help="Ask Trainer to release unused CUDA cache before backward "
+                             "every N optimizer steps. Use <=0 to disable.")
+    parser.add_argument("--resume_from_checkpoint", default=None,
+                        help="Resume Trainer state from a checkpoint path. Use 'auto' "
+                             "to resume from the latest checkpoint in output_dir.")
 
     # W&B args
     parser.add_argument("--wandb", dest="wandb", action="store_true", default=True,
@@ -116,6 +128,8 @@ class MELDDPODataset(Dataset):
         text_word_drop_prob=None,
         audio_noise_level=None,
         video_noise_level=None,
+        max_audio_seconds=None,
+        max_video_frames=None,
     ):
         self.dpo_data_path = Path(dpo_data_path)
         self.processor = processor
@@ -123,6 +137,12 @@ class MELDDPODataset(Dataset):
         self.corrupt = corrupt
         self.audio_sr = audio_sr
         self.fps = fps
+        self.max_audio_seconds = (
+            float(max_audio_seconds) if max_audio_seconds and max_audio_seconds > 0 else None
+        )
+        self.max_video_frames = (
+            int(max_video_frames) if max_video_frames and max_video_frames > 0 else None
+        )
 
         with open(self.dpo_data_path) as f:
             data = json.load(f)
@@ -154,6 +174,27 @@ class MELDDPODataset(Dataset):
     def __len__(self):
         return len(self.samples)
 
+    @staticmethod
+    def _sample_video_frames(frames, max_frames):
+        if max_frames is None or len(frames) <= max_frames:
+            return frames
+
+        # Qwen2.5-Omni expects an even frame count for temporal patching.
+        max_frames = max(2, int(max_frames))
+        if max_frames % 2:
+            max_frames -= 1
+        indices = np.linspace(0, len(frames) - 1, max_frames, dtype=int)
+        return frames[indices]
+
+    def _cap_audio(self, waveform):
+        if self.max_audio_seconds is None:
+            return waveform
+
+        max_samples = max(1, int(round(self.max_audio_seconds * self.audio_sr)))
+        if len(waveform) <= max_samples:
+            return waveform
+        return waveform[:max_samples].copy()
+
     def _build_prompt_messages(self, sample, text):
         user_content = []
         for mod in self.modalities:
@@ -180,6 +221,7 @@ class MELDDPODataset(Dataset):
                 frames = load_video_frames(sample["video_path"], fps=self.fps)
             except Exception:
                 frames = np.zeros((2, 224, 224, 3), dtype=np.uint8)
+            frames = self._sample_video_frames(frames, self.max_video_frames)
             if self.corrupt:
                 frames = apply_video_corruptions(frames, self.corruption_config)
             videos = [frames]
@@ -189,6 +231,7 @@ class MELDDPODataset(Dataset):
                 waveform, _ = load_audio_from_video(sample["video_path"], target_sr=self.audio_sr)
             except Exception:
                 waveform = np.zeros(self.audio_sr, dtype=np.float32)
+            waveform = self._cap_audio(waveform)
             if self.corrupt:
                 waveform = apply_audio_corruptions(
                     waveform,
@@ -326,17 +369,20 @@ class PreferenceTrainer(Trainer):
         chosen_batch = self._split_batch(inputs, "chosen")
         rejected_batch = self._split_batch(inputs, "rejected")
 
+        if not self.reference_free:
+            with torch.no_grad():
+                with model.disable_adapter():
+                    ref_chosen_logps = self._forward_logps(model, chosen_batch)
+                    ref_rejected_logps = self._forward_logps(model, rejected_batch)
+            if torch.cuda.is_available() and self.args.torch_empty_cache_steps is not None:
+                torch.cuda.empty_cache()
+
         policy_chosen_logps = self._forward_logps(model, chosen_batch)
         policy_rejected_logps = self._forward_logps(model, rejected_batch)
 
         if self.reference_free:
             ref_chosen_logps = torch.zeros_like(policy_chosen_logps)
             ref_rejected_logps = torch.zeros_like(policy_rejected_logps)
-        else:
-            with torch.no_grad():
-                with model.disable_adapter():
-                    ref_chosen_logps = self._forward_logps(model, chosen_batch)
-                    ref_rejected_logps = self._forward_logps(model, rejected_batch)
 
         policy_logratios = policy_chosen_logps - policy_rejected_logps
         ref_logratios = ref_chosen_logps - ref_rejected_logps
@@ -372,7 +418,9 @@ def main():
     print(
         f"DPO training with data={args.dpo_data_path}, modalities={args.modalities}, "
         f"corrupt={args.corrupt}, corruption_preset={args.corruption_preset or 'from_data_or_medium'}, "
-        f"beta={args.beta}, wandb={args.wandb}, seed={args.seed}"
+        f"beta={args.beta}, wandb={args.wandb}, seed={args.seed}, "
+        f"max_audio_seconds={args.max_audio_seconds}, max_video_frames={args.max_video_frames}, "
+        f"torch_empty_cache_steps={args.torch_empty_cache_steps}"
     )
 
     if args.wandb:
@@ -418,6 +466,8 @@ def main():
         modalities=tuple(args.modalities),
         corrupt=args.corrupt,
         corruption_preset=args.corruption_preset,
+        max_audio_seconds=args.max_audio_seconds,
+        max_video_frames=args.max_video_frames,
     )
     print(f"Resolved DPO corruption_preset={dataset.corruption_preset}")
     train_dataset, eval_dataset = maybe_split_dataset(dataset, args.eval_ratio, args.seed)
@@ -446,6 +496,9 @@ def main():
         dataloader_num_workers=0,
         seed=args.seed,
         data_seed=args.seed,
+        torch_empty_cache_steps=(
+            args.torch_empty_cache_steps if args.torch_empty_cache_steps > 0 else None
+        ),
     )
 
     trainer = PreferenceTrainer(
@@ -458,7 +511,10 @@ def main():
         reference_free=args.reference_free,
     )
 
-    trainer.train()
+    resume_from_checkpoint = (
+        True if args.resume_from_checkpoint == "auto" else args.resume_from_checkpoint
+    )
+    trainer.train(resume_from_checkpoint=resume_from_checkpoint)
 
     adapter_dir = os.path.join(args.output_dir, "lora_adapter")
     thinker.save_pretrained(adapter_dir)

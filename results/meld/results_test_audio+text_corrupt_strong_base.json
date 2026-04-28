@@ -12,6 +12,8 @@
   "invalid_predictions": 6,
   "skipped_samples": 0,
   "accuracy": 0.5153609831029186,
+  "macro_f1": 0.3965325269748563,
+  "weighted_f1": 0.52503751710229,
   "auroc_macro_ovr": 0.6517891319989781,
   "auprc_macro_ovr": 0.2507743166940173,
   "mcc": 0.3395880068276273,

@@ -49,9 +49,9 @@ submit_combo() {
         --job-name="eval_corrupt_medium_${name}_${combo// /+}" \
         "$sbatch_script" \
         "${EXTRA_ARGS[@]}" \
-        --corruption_preset strong \
+        --corruption_preset medium \
         --output_dir results/meld \
-        --modalities $combo
+        --modalities $combo 
 }
 
 for combo in "${BASE_COMBOS[@]}"; do

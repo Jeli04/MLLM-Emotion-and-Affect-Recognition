@@ -23,6 +23,15 @@ cd $SLURM_SUBMIT_DIR
 
 source ./.venv/bin/activate
 module load ffmpeg
+PYTHONPATH=. python -m src.dpo.build_dpo_dataset \
+    --split train \
+    --data_root /project2/robinjia_875/lijc/data/MELD.Raw \
+    --model_path ./ckpts/Qwen2.5-Omni-7B-GPTQ-Int4 \
+    --correct_sample_ratio 0.2 \
+    --corruption_preset strong \
+    --corrupt \
+    --modalities text audio video \
+    "$@"
 # PYTHONPATH=. python -m src.dpo.build_dpo_dataset \
 #     --split train \
 #     --data_root /project2/robinjia_875/lijc/data/MELD.Raw \
@@ -33,13 +42,13 @@ module load ffmpeg
 #     --corrupt \
 #     --modalities text audio video \
 #     "$@"
-PYTHONPATH=. python -m src.dpo.build_dpo_dataset \
-    --split train \
-    --data_root /project2/robinjia_875/lijc/data/MELD.Raw \
-    --model_path ./ckpts/Qwen2.5-Omni-7B-GPTQ-Int4 \
-    --adapter_path 
-    --correct_sample_ratio 0.2 \
-    --corruption_preset medium \
-    --corrupt \
-    --modalities text audio video \
-    "$@"
+# PYTHONPATH=. python -m src.dpo.build_dpo_dataset \
+#     --split train \
+#     --data_root /project2/robinjia_875/lijc/data/MELD.Raw \
+#     --model_path ./ckpts/Qwen2.5-Omni-7B-GPTQ-Int4 \
+#     --adapter_path 
+#     --correct_sample_ratio 0.2 \
+#     --corruption_preset medium \
+#     --corrupt \
+#     --modalities text audio video \
+#     "$@"

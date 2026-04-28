@@ -23,4 +23,15 @@ module load ffmpeg
 PYTHONPATH=. python src/finetune.py \
     --modalities text audio video \
     --corruption_preset medium \
+    --output_dir ./ckpts/finetuned_corrupt_medium \
+    --resume_from_checkpoint ./ckpts/finetuned_corrupt_medium/checkpoint-600
+    --num_epochs 1 \
     "$@"
+status=$?
+if [ "$status" -eq 135 ]; then
+    echo "ERROR: Python terminated with SIGBUS (bus error). This is a native-code/OS signal, so Python try/except cannot recover from it. Check the faulthandler traceback above for the active Python stack." >&2
+fi
+exit "$status"
+# PYTHONPATH=. python src/finetune.py \
+#     --modalities text audio video \
+#     "$@"

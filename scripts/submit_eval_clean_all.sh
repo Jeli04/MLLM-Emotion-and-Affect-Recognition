@@ -50,7 +50,8 @@ submit_combo() {
         "$sbatch_script" \
         "${EXTRA_ARGS[@]}" \
         --output_dir results/meld \
-        --modalities $combo
+        --modalities $combo \
+        --corruption_preset medium
 }
 
 for combo in "${BASE_COMBOS[@]}"; do

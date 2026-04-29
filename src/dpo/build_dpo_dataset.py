@@ -70,6 +70,11 @@ def parse_args():
                         help="Corruption preset to use when --corrupt is enabled")
     parser.add_argument("--output_dir", default=os.path.join("results", "dpo"),
                         help="Directory where evaluation and DPO files are saved")
+    parser.add_argument(
+        "--output_name_suffix",
+        default=None,
+        help="Optional suffix to append to output filenames, e.g. student_teacher",
+    )
     parser.add_argument("--correct_sample_ratio", type=float, default=0.15,
                         help="Target fraction of final DPO samples drawn from correct model predictions")
     parser.add_argument("--correct_sample_seed", type=int, default=42,
@@ -385,10 +390,16 @@ def main():
 
     modalities_str = "+".join(sorted(args.modalities))
     corrupt_str = f"corrupt_{args.corruption_preset}" if args.corrupt else "clean"
-    model_str = "finetuned" if args.adapter_path else "base"
-    output_filename = f"results_{args.split}_{modalities_str}_{corrupt_str}_{model_str}.json"
+    
+    if args.output_name_suffix:
+        suffix = args.output_name_suffix.strip().replace(" ", "_")
+    else:
+        suffix = "finetuned" if args.adapter_path else "base"
+
+    output_filename = f"results_{args.split}_{modalities_str}_{corrupt_str}_{suffix}.json"
     output_path = os.path.join(args.output_dir, output_filename)
-    dpo_output_filename = f"dpo_samples_{args.split}_{modalities_str}_{corrupt_str}_{model_str}.json"
+
+    dpo_output_filename = f"dpo_samples_{args.split}_{modalities_str}_{corrupt_str}_{suffix}.json"
     dpo_output_path = os.path.join(args.output_dir, dpo_output_filename)
 
     results_json = {

@@ -41,6 +41,6 @@ PYTHONPATH=. uv run --active --no-sync python src/distillation_finetune.py \
     --full_ce_weight 0.0 \
     --mask_ce_weight 1.0 \
     --lambda_kl 0.03 \
-    --output_dir ./ckpts/finetuned_distill_clean_teacher_base_lk0.03_medium \
-    --resume_from_checkpoint ./ckpts/finetuned_distill_clean_teacher_base_lk0.03_medium/checkpoint-1400 \
-    --wandb_run_name distill_clean_teacher_base_lk0.03_medium
+    --corruption_preset strong \
+    --output_dir ./ckpts/finetuned_distill_clean_teacher_base_lk0.03_strong \
+    --wandb_run_name distill_clean_teacher_base_lk0.03_strong

@@ -8,7 +8,7 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn.functional as F
-from peft import LoraConfig, TaskType, get_peft_model
+from peft import LoraConfig, PeftModel, TaskType, get_peft_model
 from torch.utils.data import Dataset, random_split
 from transformers import (
     Qwen2_5OmniForConditionalGeneration,
@@ -57,6 +57,19 @@ def parse_args():
                         help="Which modalities to include in the input")
     parser.add_argument("--output_dir", default="./ckpts/dpo_finetuned",
                         help="Directory to save DPO-tuned LoRA adapter")
+    parser.add_argument("--adapter_path", "--initial_adapter_path", dest="adapter_path",
+                        default=None,
+                        help="Optional SFT/student-teacher LoRA adapter to continue "
+                             "training with DPO. When set, the adapter is loaded as "
+                             "the trainable policy adapter.")
+    parser.add_argument("--reference_adapter_path", default=None,
+                        help="Optional frozen LoRA adapter to use for DPO reference "
+                             "logprobs. Defaults to --adapter_path when provided. "
+                             "If omitted without --adapter_path, the base model is "
+                             "used as the reference.")
+    parser.add_argument("--base_reference", action="store_true", default=False,
+                        help="Use the base model with adapters disabled for reference "
+                             "logprobs, even when --adapter_path is provided.")
     parser.add_argument("--num_epochs", type=int, default=3)
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=8)
@@ -72,7 +85,8 @@ def parse_args():
     parser.add_argument("--logging_steps", type=int, default=10)
     parser.add_argument("--save_steps", type=int, default=200)
     parser.add_argument("--reference_free", action="store_true",
-                        help="Use reference-free preference optimization instead of disabling the LoRA adapter for reference logprobs")
+                        help="Use reference-free preference optimization and skip "
+                             "reference-model logprobs")
     parser.add_argument("--corrupt", action="store_true", default=True,
                         help="Apply the same random input corruption style used by supervised finetuning")
     parser.add_argument("--no_corrupt", dest="corrupt", action="store_false")
@@ -105,6 +119,13 @@ def parse_args():
     parser.add_argument("--wandb_run_name", type=str, default=None,
                         help="Optional W&B run name")
     return parser.parse_args()
+
+
+def set_adapter_trainability(model, adapter_name, trainable):
+    marker = f".{adapter_name}."
+    for name, param in model.named_parameters():
+        if marker in name:
+            param.requires_grad = trainable
 
 
 class MELDDPODataset(Dataset):
@@ -319,10 +340,22 @@ class DPODataCollator:
 
 
 class PreferenceTrainer(Trainer):
-    def __init__(self, *args, beta=0.1, reference_free=False, **kwargs):
+    def __init__(
+        self,
+        *args,
+        beta=0.1,
+        reference_free=False,
+        policy_adapter_name="default",
+        reference_adapter_name=None,
+        base_reference=True,
+        **kwargs,
+    ):
         super().__init__(*args, **kwargs)
         self.beta = beta
         self.reference_free = reference_free
+        self.policy_adapter_name = policy_adapter_name
+        self.reference_adapter_name = reference_adapter_name
+        self.base_reference = base_reference
 
     @staticmethod
     def _split_batch(inputs, prefix):
@@ -365,18 +398,48 @@ class PreferenceTrainer(Trainer):
         logits = outputs.logits if hasattr(outputs, "logits") else outputs[0]
         return self._get_batch_logps(logits, labels)
 
+    def _set_adapter(self, model, adapter_name, trainable=None):
+        if adapter_name is not None and hasattr(model, "set_adapter"):
+            model.set_adapter(adapter_name)
+            if trainable is not None:
+                set_adapter_trainability(model, adapter_name, trainable)
+
+    def _reference_logps(self, model, chosen_batch, rejected_batch):
+        was_training = model.training
+        model.eval()
+        try:
+            if self.reference_adapter_name is not None:
+                self._set_adapter(model, self.reference_adapter_name, trainable=False)
+                ref_chosen_logps = self._forward_logps(model, chosen_batch)
+                ref_rejected_logps = self._forward_logps(model, rejected_batch)
+                return ref_chosen_logps, ref_rejected_logps
+
+            if self.base_reference:
+                with model.disable_adapter():
+                    ref_chosen_logps = self._forward_logps(model, chosen_batch)
+                    ref_rejected_logps = self._forward_logps(model, rejected_batch)
+                return ref_chosen_logps, ref_rejected_logps
+
+            raise ValueError("DPO reference is not configured. Use --reference_free, "
+                             "--base_reference, or --reference_adapter_path.")
+        finally:
+            if was_training:
+                model.train()
+            self._set_adapter(model, self.policy_adapter_name, trainable=True)
+
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         chosen_batch = self._split_batch(inputs, "chosen")
         rejected_batch = self._split_batch(inputs, "rejected")
 
         if not self.reference_free:
             with torch.no_grad():
-                with model.disable_adapter():
-                    ref_chosen_logps = self._forward_logps(model, chosen_batch)
-                    ref_rejected_logps = self._forward_logps(model, rejected_batch)
+                ref_chosen_logps, ref_rejected_logps = self._reference_logps(
+                    model, chosen_batch, rejected_batch,
+                )
             if torch.cuda.is_available() and self.args.torch_empty_cache_steps is not None:
                 torch.cuda.empty_cache()
 
+        self._set_adapter(model, self.policy_adapter_name, trainable=True)
         policy_chosen_logps = self._forward_logps(model, chosen_batch)
         policy_rejected_logps = self._forward_logps(model, rejected_batch)
 
@@ -415,12 +478,35 @@ def maybe_split_dataset(dataset, eval_ratio, seed):
 def main():
     args = parse_args()
     set_seed(args.seed)
+
+    if (
+        not args.reference_free
+        and args.base_reference
+        and args.reference_adapter_path is not None
+    ):
+        raise ValueError("--base_reference cannot be combined with --reference_adapter_path")
+
+    reference_adapter_path = args.reference_adapter_path
+    use_base_reference = args.base_reference
+    if args.reference_free:
+        reference_adapter_path = None
+        use_base_reference = False
+    elif reference_adapter_path is None:
+        if args.adapter_path is not None and not args.base_reference:
+            reference_adapter_path = args.adapter_path
+        else:
+            use_base_reference = True
+    else:
+        use_base_reference = False
+
     print(
         f"DPO training with data={args.dpo_data_path}, modalities={args.modalities}, "
         f"corrupt={args.corrupt}, corruption_preset={args.corruption_preset or 'from_data_or_medium'}, "
         f"beta={args.beta}, wandb={args.wandb}, seed={args.seed}, "
         f"max_audio_seconds={args.max_audio_seconds}, max_video_frames={args.max_video_frames}, "
-        f"torch_empty_cache_steps={args.torch_empty_cache_steps}"
+        f"torch_empty_cache_steps={args.torch_empty_cache_steps}, "
+        f"adapter_path={args.adapter_path}, reference_adapter_path={reference_adapter_path}, "
+        f"base_reference={use_base_reference}, reference_free={args.reference_free}"
     )
 
     if args.wandb:
@@ -436,15 +522,36 @@ def main():
         enable_audio_output=False,
     )
 
-    lora_config = LoraConfig(
-        r=args.lora_r,
-        lora_alpha=args.lora_alpha,
-        lora_dropout=args.lora_dropout,
-        target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
-        task_type=TaskType.CAUSAL_LM,
-    )
+    policy_adapter_name = "default"
+    reference_adapter_name = None
+    if args.adapter_path is not None:
+        print(f"Loading trainable policy LoRA adapter from {args.adapter_path}...")
+        thinker = PeftModel.from_pretrained(
+            model.thinker,
+            args.adapter_path,
+            adapter_name=policy_adapter_name,
+            is_trainable=True,
+        )
+    else:
+        lora_config = LoraConfig(
+            r=args.lora_r,
+            lora_alpha=args.lora_alpha,
+            lora_dropout=args.lora_dropout,
+            target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+            task_type=TaskType.CAUSAL_LM,
+        )
+        thinker = get_peft_model(model.thinker, lora_config)
 
-    thinker = get_peft_model(model.thinker, lora_config)
+    if reference_adapter_path is not None and not args.reference_free:
+        reference_adapter_name = "reference"
+        print(f"Loading frozen reference LoRA adapter from {reference_adapter_path}...")
+        thinker.load_adapter(
+            reference_adapter_path,
+            adapter_name=reference_adapter_name,
+            is_trainable=False,
+        )
+        set_adapter_trainability(thinker, reference_adapter_name, False)
+        thinker.set_adapter(policy_adapter_name)
 
     if hasattr(model, "talker"):
         del model.talker
@@ -457,6 +564,8 @@ def main():
 
     if hasattr(thinker.config, "use_cache"):
         thinker.config.use_cache = False
+    if hasattr(thinker, "enable_input_require_grads"):
+        thinker.enable_input_require_grads()
     thinker.gradient_checkpointing_enable()
     thinker.print_trainable_parameters()
 
@@ -509,6 +618,9 @@ def main():
         data_collator=DPODataCollator(processor.tokenizer.pad_token_id),
         beta=args.beta,
         reference_free=args.reference_free,
+        policy_adapter_name=policy_adapter_name,
+        reference_adapter_name=reference_adapter_name,
+        base_reference=use_base_reference,
     )
 
     resume_from_checkpoint = (
@@ -517,7 +629,8 @@ def main():
     trainer.train(resume_from_checkpoint=resume_from_checkpoint)
 
     adapter_dir = os.path.join(args.output_dir, "lora_adapter")
-    thinker.save_pretrained(adapter_dir)
+    thinker.set_adapter(policy_adapter_name)
+    thinker.save_pretrained(adapter_dir, selected_adapters=[policy_adapter_name])
     processor.save_pretrained(adapter_dir)
     print(f"DPO adapter saved to {adapter_dir}")
 

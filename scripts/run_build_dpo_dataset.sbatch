@@ -27,11 +27,24 @@ PYTHONPATH=. python -m src.dpo.build_dpo_dataset \
     --split train \
     --data_root /project2/robinjia_875/lijc/data/MELD.Raw \
     --model_path ./ckpts/Qwen2.5-Omni-7B-GPTQ-Int4 \
+    --adapter_path ./ckpts/finetuned_distill_clean_teacher_base_lk0.03_medium/lora_adapter \
     --correct_sample_ratio 0.2 \
     --corruption_preset strong \
+    --output_name_suffix student_teacher \
     --corrupt \
     --modalities text audio video \
     "$@"
+# PYTHONPATH=. python -m src.dpo.build_dpo_dataset \
+#     --split train \
+#     --data_root /project2/robinjia_875/lijc/data/MELD.Raw \
+#     --model_path ./ckpts/Qwen2.5-Omni-7B-GPTQ-Int4 \
+#     --adapter_path ./ckpts/finetuned_medium/lora_adapter \
+#     --correct_sample_ratio 0.2 \
+#     --corruption_preset strong \
+#     --output_name_suffix student_teacher \
+#     --corrupt \
+#     --modalities text audio video \
+#     "$@"
 # PYTHONPATH=. python -m src.dpo.build_dpo_dataset \
 #     --split train \
 #     --data_root /project2/robinjia_875/lijc/data/MELD.Raw \

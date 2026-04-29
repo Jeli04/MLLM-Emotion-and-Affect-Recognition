@@ -34,6 +34,16 @@ FINETUNED_COMBOS=(
     "text audio video"
 )
 
+DPO_COMBOS=(
+    # "text"
+    "audio"
+    "video"
+    # "text audio"
+    # "text video"
+    # "audio video"
+    # "text audio video"
+)
+
 BASE_SBATCH="scripts/run_eval_base_corruption.sbatch"
 FINETUNED_SBATCH="scripts/run_eval_finetune_corruption.sbatch"
 
@@ -54,10 +64,14 @@ submit_combo() {
         --modalities $combo 
 }
 
-for combo in "${BASE_COMBOS[@]}"; do
-    submit_combo "base" "$BASE_SBATCH" "$combo"
-done
+# for combo in "${BASE_COMBOS[@]}"; do
+#     submit_combo "base" "$BASE_SBATCH" "$combo"
+# done
 
 # for combo in "${FINETUNED_COMBOS[@]}"; do
 #     submit_combo "finetuned" "$FINETUNED_SBATCH" "$combo"
 # done
+
+for combo in "${DPO_COMBOS[@]}"; do
+    submit_combo "dpo" "$FINETUNED_SBATCH" "$combo"
+done

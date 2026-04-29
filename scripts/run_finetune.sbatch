@@ -22,11 +22,16 @@ source ./.venv/bin/activate
 module load ffmpeg
 PYTHONPATH=. python src/finetune.py \
     --modalities text audio video \
-    --corruption_preset medium \
-    --output_dir ./ckpts/finetuned_corrupt_medium \
-    --resume_from_checkpoint ./ckpts/finetuned_corrupt_medium/checkpoint-600
-    --num_epochs 1 \
+    --corruption_preset strong \
+    --output_dir ./ckpts/finetuned_corrupt_strong \
+    --num_epochs 3 \
     "$@"
+# PYTHONPATH=. python src/finetune.py \
+#     --modalities text audio video \
+#     --no_corrupt \
+#     --output_dir ./ckpts/finetuned_no_corruption \
+#     --num_epochs 3 \
+#     "$@"
 status=$?
 if [ "$status" -eq 135 ]; then
     echo "ERROR: Python terminated with SIGBUS (bus error). This is a native-code/OS signal, so Python try/except cannot recover from it. Check the faulthandler traceback above for the active Python stack." >&2

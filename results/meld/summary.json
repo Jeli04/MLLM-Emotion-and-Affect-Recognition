@@ -1,0 +1,113 @@
+{
+  "split": "test",
+  "corrupt": true,
+  "corruption_preset": "medium",
+  "adapter_path": null,
+  "model_path": "/home1/animmaga/MLLM-Emotion-and-Affect-Recognition/Qwen2.5-Omni-7B-GPTQ-Int4",
+  "run_label": "add_affgpt",
+  "runs": [
+    {
+      "modalities": [
+        "text"
+      ],
+      "modalities_tag": "text",
+      "output_path": "results/meld/results_test_text_corrupt_medium_add_affgpt.json",
+      "accuracy": 0.49074074074074076,
+      "auroc_macro_ovr": 0.6406528130338945,
+      "auprc_macro_ovr": 0.23780485980185487,
+      "mcc": 0.3270852042137817,
+      "valid_predictions": 2592,
+      "invalid_predictions": 18,
+      "skipped_samples": 0
+    },
+    {
+      "modalities": [
+        "audio"
+      ],
+      "modalities_tag": "audio",
+      "output_path": "results/meld/results_test_audio_corrupt_medium_add_affgpt.json",
+      "accuracy": 0.5017327685791297,
+      "auroc_macro_ovr": 0.6227645428728403,
+      "auprc_macro_ovr": 0.22205917824260418,
+      "mcc": 0.2963318900777047,
+      "valid_predictions": 2597,
+      "invalid_predictions": 11,
+      "skipped_samples": 2
+    },
+    {
+      "modalities": [
+        "video"
+      ],
+      "modalities_tag": "video",
+      "output_path": "results/meld/results_test_video_corrupt_medium_add_affgpt.json",
+      "accuracy": 0.361579754601227,
+      "auroc_macro_ovr": 0.524767902621308,
+      "auprc_macro_ovr": 0.1530107296262953,
+      "mcc": 0.0714429364153094,
+      "valid_predictions": 2608,
+      "invalid_predictions": 0,
+      "skipped_samples": 2
+    },
+    {
+      "modalities": [
+        "text",
+        "audio"
+      ],
+      "modalities_tag": "text+audio",
+      "output_path": "results/meld/results_test_text+audio_corrupt_medium_add_affgpt.json",
+      "accuracy": 0.5573137784639135,
+      "auroc_macro_ovr": 0.6553178293041487,
+      "auprc_macro_ovr": 0.2567374699972521,
+      "mcc": 0.36693781689945293,
+      "valid_predictions": 2591,
+      "invalid_predictions": 17,
+      "skipped_samples": 2
+    },
+    {
+      "modalities": [
+        "text",
+        "video"
+      ],
+      "modalities_tag": "text+video",
+      "output_path": "results/meld/results_test_text+video_corrupt_medium_add_affgpt.json",
+      "accuracy": 0.4817096649980747,
+      "auroc_macro_ovr": 0.6313912996052753,
+      "auprc_macro_ovr": 0.23013304011414665,
+      "mcc": 0.30162987296444516,
+      "valid_predictions": 2597,
+      "invalid_predictions": 11,
+      "skipped_samples": 2
+    },
+    {
+      "modalities": [
+        "audio",
+        "video"
+      ],
+      "modalities_tag": "audio+video",
+      "output_path": "results/meld/results_test_audio+video_corrupt_medium_add_affgpt.json",
+      "accuracy": 0.48847040737893926,
+      "auroc_macro_ovr": 0.6170252121774621,
+      "auprc_macro_ovr": 0.2178423005401712,
+      "mcc": 0.2797271539912765,
+      "valid_predictions": 2602,
+      "invalid_predictions": 6,
+      "skipped_samples": 2
+    },
+    {
+      "modalities": [
+        "text",
+        "audio",
+        "video"
+      ],
+      "modalities_tag": "text+audio+video",
+      "output_path": "results/meld/results_test_text+audio+video_corrupt_medium_add_affgpt.json",
+      "accuracy": 0.5363601385148133,
+      "auroc_macro_ovr": 0.6465385430321884,
+      "auprc_macro_ovr": 0.24845699266838753,
+      "mcc": 0.3420289120005153,
+      "valid_predictions": 2599,
+      "invalid_predictions": 9,
+      "skipped_samples": 2
+    }
+  ]
+}

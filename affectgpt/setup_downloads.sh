@@ -22,6 +22,15 @@ DATASET_DIR="${ROOT_DIR}/../dataset"
 MELD_RAW="${ROOT_DIR}/MELD.Raw"
 MELD_TAR="${ROOT_DIR}/MELD.Raw.tar.gz"
 
+# TEST_ONLY=1 → only preprocess the test split (~2610 samples instead of ~13k)
+TEST_ONLY="${TEST_ONLY:-0}"
+
+# MAX_TEST_SAMPLES=N → only preprocess first N test samples (debug / smoke)
+MAX_TEST_SAMPLES="${MAX_TEST_SAMPLES:-0}"
+
+# FACE_WORKERS=N → parallel processes for MediaPipe face extraction
+FACE_WORKERS="${FACE_WORKERS:-4}"
+
 # ---- Check prerequisites ----
 # huggingface_hub v1.x renamed the CLI from "huggingface-cli" to "hf"
 if command -v hf &>/dev/null; then
@@ -159,6 +168,8 @@ import pandas as pd
 
 meld_raw = '${MELD_RAW}'
 save_root = '${MELD_PROC}'
+test_only = ${TEST_ONLY} == 1
+max_test_samples = ${MAX_TEST_SAMPLES}
 
 emos = ['anger', 'joy', 'sadness', 'neutral', 'disgust', 'fear', 'surprise']
 emo2idx = {emo: i for i, emo in enumerate(emos)}
@@ -185,11 +196,26 @@ print(f'train: {len(train_names)}, val: {len(val_names)}, test: {len(test_names)
 save_video = os.path.join(save_root, 'subvideo')
 name2eng = {}
 whole_corpus = {}
-for datatype, names, labels, engs, video_dir in [
+splits_to_process = [
     ('train', train_names, train_labels, train_engs, 'train_splits'),
     ('val',   val_names,   val_labels,   val_engs,   'dev_splits_complete'),
     ('test',  test_names,  test_labels,  test_engs,  'output_repeated_splits_test'),
-]:
+]
+if test_only:
+    splits_to_process = [s for s in splits_to_process if s[0] == 'test']
+    print('TEST_ONLY=1: only processing test split.')
+if max_test_samples > 0:
+    capped = []
+    for s in splits_to_process:
+        dt, names, labels, engs, vd = s
+        if dt == 'test':
+            names = names[:max_test_samples]
+            labels = labels[:max_test_samples]
+            engs = engs[:max_test_samples]
+            print(f'MAX_TEST_SAMPLES={max_test_samples}: capped test split.')
+        capped.append((dt, names, labels, engs, vd))
+    splits_to_process = capped
+for datatype, names, labels, engs, video_dir in splits_to_process:
     whole_corpus[datatype] = {}
     video_root = os.path.join(meld_raw, video_dir)
     for ii, name in enumerate(names):
@@ -206,12 +232,12 @@ for datatype, names, labels, engs, video_dir in [
         else:
             print(f'WARNING: missing video {src}')
 
-# Save label.npz
+# Save label.npz (empty dicts for splits we skipped)
 np.savez_compressed(
     os.path.join(save_root, 'label.npz'),
-    train_corpus=whole_corpus['train'],
-    val_corpus=whole_corpus['val'],
-    test_corpus=whole_corpus['test'],
+    train_corpus=whole_corpus.get('train', {}),
+    val_corpus=whole_corpus.get('val', {}),
+    test_corpus=whole_corpus.get('test', {}),
 )
 print('Saved label.npz')
 
@@ -243,10 +269,11 @@ print(f'Saved {trans_path} ({len(rows)} rows)')
     fi
 
     # 3e. Extract face crops from videos using MediaPipe
-    echo "Extracting face crops from videos..."
+    echo "Extracting face crops from videos with ${FACE_WORKERS} workers..."
     python extract_faces.py \
         --video_dir "${MELD_PROC}/subvideo" \
-        --output_dir "${MELD_PROC}/openface_face"
+        --output_dir "${MELD_PROC}/openface_face" \
+        --workers "${FACE_WORKERS}"
     echo "  Face extraction done."
 fi
 
@@ -274,10 +301,11 @@ fi
 FACE_COUNT=$(ls "${MELD_PROC}/openface_face/" 2>/dev/null | wc -l)
 VIDEO_COUNT=$(ls "${MELD_PROC}/subvideo/" 2>/dev/null | wc -l)
 if [ "${FACE_COUNT}" -lt "${VIDEO_COUNT}" ]; then
-    echo "Resuming face extraction (${FACE_COUNT}/${VIDEO_COUNT})..."
+    echo "Resuming face extraction (${FACE_COUNT}/${VIDEO_COUNT}) with ${FACE_WORKERS} workers..."
     python extract_faces.py \
         --video_dir "${MELD_PROC}/subvideo" \
-        --output_dir "${MELD_PROC}/openface_face"
+        --output_dir "${MELD_PROC}/openface_face" \
+        --workers "${FACE_WORKERS}"
     echo "  Face extraction done."
 fi
 

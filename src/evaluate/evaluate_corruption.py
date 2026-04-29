@@ -1,7 +1,9 @@
 import argparse
 import json
 import logging
+import math
 import os
+import random
 import warnings
 from functools import partial
 
@@ -11,7 +13,7 @@ logging.getLogger("root").setLevel(logging.ERROR)
 from transformers import Qwen2_5OmniForConditionalGeneration, Qwen2_5OmniProcessor, set_seed
 from peft import PeftModel
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
 from sklearn.metrics import (
     classification_report,
@@ -63,9 +65,27 @@ def parse_args():
                         help="Corruption preset to use when corruption is enabled")
     parser.add_argument("--output_dir", default=os.path.join("results", "meld"),
                         help="Directory where MELD corruption results are saved")
+    parser.add_argument("--data_subset_percent", type=float, default=100.0,
+                        help="Percentage of the split to evaluate, sampled deterministically "
+                             "with --seed (default: 100)")
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed for python/numpy/torch (controls corruption RNG)")
-    return parser.parse_args()
+    args = parser.parse_args()
+    if not 0 < args.data_subset_percent <= 100:
+        parser.error("--data_subset_percent must be greater than 0 and at most 100")
+    return args
+
+
+def build_eval_indices(total_samples, subset_percent, seed):
+    if subset_percent >= 100 or total_samples == 0:
+        return list(range(total_samples))
+
+    subset_size = min(
+        total_samples,
+        max(1, math.ceil(total_samples * subset_percent / 100.0)),
+    )
+    rng = random.Random(seed)
+    return sorted(rng.sample(range(total_samples), subset_size))
 
 
 def eval_collate(batch, pad_token_id):
@@ -83,7 +103,7 @@ def main():
     print(
         f"Evaluating on split='{args.split}' with modalities={args.modalities}, "
         f"corrupt={args.corrupt}, corruption_preset={args.corruption_preset}, "
-        f"seed={args.seed}"
+        f"data_subset_percent={args.data_subset_percent:g}, seed={args.seed}"
     )
 
     processor = Qwen2_5OmniProcessor.from_pretrained(args.model_path)
@@ -109,9 +129,22 @@ def main():
         corruption_preset=args.corruption_preset,
         for_training=False,
     )
+    full_dataset_samples = len(dataset)
+    eval_indices = build_eval_indices(
+        full_dataset_samples,
+        args.data_subset_percent,
+        args.seed,
+    )
+    using_subset = len(eval_indices) != full_dataset_samples
+    eval_dataset = Subset(dataset, eval_indices) if using_subset else dataset
+    if using_subset:
+        print(
+            f"Using {len(eval_indices)}/{full_dataset_samples} samples "
+            f"({args.data_subset_percent:g}% requested)"
+        )
 
     loader = DataLoader(
-        dataset,
+        eval_dataset,
         batch_size=1,
         shuffle=False,
         collate_fn=partial(eval_collate, pad_token_id=processor.tokenizer.pad_token_id),
@@ -124,9 +157,10 @@ def main():
     skipped_samples = []
     per_sample_results = []
 
-    for i, batch in enumerate(tqdm(loader, desc="Evaluating")):
+    for subset_pos, batch in enumerate(tqdm(loader, desc="Evaluating")):
+        raw_idx = eval_indices[subset_pos]
         gt_emotion = batch.pop("emotions")[0]
-        raw_sample = dataset.raw_dataset[i]
+        raw_sample = dataset.raw_dataset[raw_idx]
 
         inputs = {
             k: v.to(first_device) if isinstance(v, torch.Tensor) else v
@@ -152,9 +186,9 @@ def main():
                 clean_up_tokenization_spaces=False,
             )
         except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
-            skipped_samples.append((i, str(e), gt_emotion))
-            per_sample_results.append({
-                "sample_index": i,
+            skipped_samples.append((raw_idx, str(e), gt_emotion))
+            sample_result = {
+                "sample_index": raw_idx,
                 "dialogue_id": raw_sample["dialogue_id"],
                 "utterance_id": raw_sample["utterance_id"],
                 "text": raw_sample["text"],
@@ -164,17 +198,20 @@ def main():
                 "valid": False,
                 "skipped": True,
                 "error": str(e),
-            })
+            }
+            if using_subset:
+                sample_result["subset_position"] = subset_pos
+            per_sample_results.append(sample_result)
             torch.cuda.empty_cache()
-            tqdm.write(f"  Skipped sample {i} (OOM/error): {str(e)[:100]}")
+            tqdm.write(f"  Skipped sample {raw_idx} (OOM/error): {str(e)[:100]}")
             continue
 
         pred = output_text[0].strip().lower()
         raw_output = output_text[0].strip()
         is_valid = pred in VALID_EMOTIONS
 
-        per_sample_results.append({
-            "sample_index": i,
+        sample_result = {
+            "sample_index": raw_idx,
             "dialogue_id": raw_sample["dialogue_id"],
             "utterance_id": raw_sample["utterance_id"],
             "text": raw_sample["text"],
@@ -183,10 +220,13 @@ def main():
             "raw_model_output": raw_output,
             "valid": is_valid,
             "skipped": False,
-        })
+        }
+        if using_subset:
+            sample_result["subset_position"] = subset_pos
+        per_sample_results.append(sample_result)
 
         if not is_valid:
-            invalid_predictions.append((i, raw_output, gt_emotion))
+            invalid_predictions.append((raw_idx, raw_output, gt_emotion))
         else:
             all_preds.append(pred)
             all_labels.append(gt_emotion)
@@ -199,7 +239,10 @@ def main():
         f"Split: {args.split} | Modalities: {args.modalities} | "
         f"Corrupt: {args.corrupt} | Preset: {args.corruption_preset}"
     )
-    print(f"Total samples: {len(dataset)}")
+    print(f"Total samples: {len(eval_dataset)}")
+    if using_subset:
+        print(f"Full dataset samples: {full_dataset_samples}")
+        print(f"Data subset percent: {args.data_subset_percent:g}")
     print(f"Valid predictions: {len(all_preds)}")
     print(f"Invalid predictions: {len(invalid_predictions)}")
     print(f"Skipped (OOM/error): {len(skipped_samples)}")
@@ -244,12 +287,22 @@ def main():
 
         y_true_bin = label_binarize(all_labels, classes=label_names)
         y_pred_bin = label_binarize(all_preds, classes=label_names)
-        auroc = roc_auc_score(y_true_bin, y_pred_bin, average="macro")
-        auprc = average_precision_score(y_true_bin, y_pred_bin, average="macro")
+        try:
+            auroc = roc_auc_score(y_true_bin, y_pred_bin, average="macro")
+        except ValueError as e:
+            print(f"Macro AUROC (OVR):            unavailable ({e})")
+
+        try:
+            auprc = average_precision_score(y_true_bin, y_pred_bin, average="macro")
+        except ValueError as e:
+            print(f"Macro Avg Precision (AUPRC):  unavailable ({e})")
+
         mcc = matthews_corrcoef(all_labels, all_preds)
 
-        print(f"Macro AUROC (OVR):            {auroc:.4f}")
-        print(f"Macro Avg Precision (AUPRC):  {auprc:.4f}")
+        if auroc is not None:
+            print(f"Macro AUROC (OVR):            {auroc:.4f}")
+        if auprc is not None:
+            print(f"Macro Avg Precision (AUPRC):  {auprc:.4f}")
         print(f"MCC:                          {mcc:.4f}")
 
     peak_vram = torch.cuda.max_memory_allocated() / (1024 ** 3)
@@ -258,7 +311,11 @@ def main():
     modalities_str = "+".join(sorted(args.modalities))
     corrupt_str = f"corrupt_{args.corruption_preset}" if args.corrupt else "clean"
     model_str = args.run_label or ("finetuned" if args.adapter_path else "base")
-    output_filename = f"results_{args.split}_{modalities_str}_{corrupt_str}_{model_str}.json"
+    subset_str = ""
+    if using_subset:
+        subset_pct = f"{args.data_subset_percent:g}".replace(".", "p")
+        subset_str = f"_subset{subset_pct}pct"
+    output_filename = f"results_{args.split}_{modalities_str}_{corrupt_str}_{model_str}{subset_str}.json"
     output_path = os.path.join(args.output_dir, output_filename)
 
     results_json = {
@@ -267,7 +324,10 @@ def main():
         "corrupt": args.corrupt,
         "corruption_preset": args.corruption_preset,
         "adapter_path": args.adapter_path,
-        "total_samples": len(dataset),
+        "data_subset_percent": args.data_subset_percent,
+        "total_samples": len(eval_dataset),
+        "full_dataset_samples": full_dataset_samples,
+        "sample_indices": eval_indices if using_subset else None,
         "valid_predictions": len(all_preds),
         "invalid_predictions": len(invalid_predictions),
         "skipped_samples": len(skipped_samples),

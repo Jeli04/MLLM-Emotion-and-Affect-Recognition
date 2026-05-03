@@ -2,11 +2,12 @@ import argparse
 import json
 import logging
 import os
+from collections import Counter
 from functools import partial
 
 import numpy as np
 import torch
-from torch.utils.data import Subset
+from torch.utils.data import Subset, WeightedRandomSampler
 from transformers import (
     Qwen2_5OmniForConditionalGeneration,
     Qwen2_5OmniProcessor,
@@ -37,6 +38,7 @@ from src.iemocap_dataset import (
     EMOTION2ID as IEMOCAP_EMOTION2ID,
     collate_fn as iemocap_collate_fn,
     compute_iemocap_train_val_holdout_split,
+    iemocap_train_subset_sample_weights,
 )
 
 
@@ -91,6 +93,24 @@ def parse_args():
         default=43,
         help="RNG seed for shuffling non-holdout rows before train/val split (IEMOCAP only)",
     )
+    parser.add_argument(
+        "--iemocap_weighted_sampler",
+        action="store_true",
+        help="IEMOCAP only: balance train batches with WeightedRandomSampler "
+             "(mild sqrt-style weights + cap vs majority class)",
+    )
+    parser.add_argument(
+        "--iemocap_sampler_power",
+        type=float,
+        default=0.5,
+        help="IEMOCAP weighted sampling: exponent on (n_max/n_c); 0.5=sqrt (default), 1.0=stronger",
+    )
+    parser.add_argument(
+        "--iemocap_sampler_max_ratio",
+        type=float,
+        default=40.0,
+        help="IEMOCAP weighted sampling: max per-sample weight vs majority after power (default 40)",
+    )
     parser.add_argument("--modalities", nargs="+", default=["text"],
                         choices=["text", "audio", "video"],
                         help="Which modalities to include in the input")
@@ -142,6 +162,12 @@ def parse_args():
             parser.error("--manifest is required when --dataset iemocap")
         if not 0.0 <= args.iemocap_val_ratio < 1.0:
             parser.error("--iemocap_val_ratio must be in [0, 1)")
+    if args.iemocap_weighted_sampler and args.dataset != "iemocap":
+        parser.error("--iemocap_weighted_sampler requires --dataset iemocap")
+    if args.iemocap_sampler_power < 0:
+        parser.error("--iemocap_sampler_power must be >= 0")
+    if args.iemocap_sampler_max_ratio <= 0:
+        parser.error("--iemocap_sampler_max_ratio must be > 0")
     return args
 
 
@@ -165,6 +191,21 @@ def _unwrap_logits(logits, labels):
             except TypeError:
                 continue
     raise TypeError(f"Could not find logits tensor in output type {type(logits)}")
+
+
+class _TrainerWithWeightedSampler(Trainer):
+    """Optional WeightedRandomSampler for IEMOCAP train (single-process DataLoader)."""
+
+    def __init__(self, *args, train_weighted_sampler=None, **kwargs):
+        self._train_weighted_sampler = train_weighted_sampler
+        super().__init__(*args, **kwargs)
+
+    def _get_train_sampler(self, *args, **kwargs):
+        # Newer `transformers.Trainer` passes the train dataset into `_get_train_sampler`;
+        # older versions call with no extra args.
+        if self._train_weighted_sampler is not None:
+            return self._train_weighted_sampler
+        return super()._get_train_sampler(*args, **kwargs)
 
 
 def preprocess_logits_for_metrics(logits, labels):
@@ -229,6 +270,11 @@ def main():
         f"predict_corruption={args.predict_corruption}, wandb={args.wandb}, "
         f"seed={args.seed}"
     )
+    if args.iemocap_weighted_sampler:
+        print(
+            f"IEMOCAP weighted sampler: power={args.iemocap_sampler_power}, "
+            f"max_ratio={args.iemocap_sampler_max_ratio}"
+        )
 
     # Set W&B env vars before Trainer is created
     if args.wandb:
@@ -284,6 +330,7 @@ def main():
         predict_corruption=args.predict_corruption,
         for_training=True,
     )
+    train_weighted_sampler = None
     if args.dataset == "meld":
         train_dataset = CorruptedMELDDataset(args.data_root, split="train", **common)
         val_dataset = CorruptedMELDDataset(args.data_root, split="dev", **common)
@@ -333,6 +380,34 @@ def main():
         )
         collate_fn = iemocap_collate_fn
 
+        if args.iemocap_weighted_sampler:
+            raw_df = full_iemocap.raw_dataset.df
+            sample_w = iemocap_train_subset_sample_weights(
+                train_idx,
+                raw_df,
+                power=args.iemocap_sampler_power,
+                max_ratio_to_majority=args.iemocap_sampler_max_ratio,
+            )
+            gen = torch.Generator()
+            gen.manual_seed(args.seed)
+            train_weighted_sampler = WeightedRandomSampler(
+                weights=sample_w,
+                num_samples=len(train_dataset),
+                replacement=True,
+                generator=gen,
+            )
+            ctr = Counter()
+            for ti in train_idx:
+                emo = str(raw_df.iloc[int(ti)]["emotion"]).strip().lower()
+                if emo in IEMOCAP_EMOTION2ID:
+                    ctr[emo] += 1
+            print(
+                "IEMOCAP weighted sampling: train class counts "
+                f"{dict(sorted(ctr.items(), key=lambda x: (-x[1], x[0])))}; "
+                f"per-sample weight min={sample_w.min().item():.6g} "
+                f"max={sample_w.max().item():.6g}"
+            )
+
     data_collator = partial(
         collate_fn,
         pad_token_id=processor.tokenizer.pad_token_id,
@@ -368,7 +443,7 @@ def main():
 
     training_args = TrainingArguments(**training_args_kw)
 
-    trainer = Trainer(
+    trainer = _TrainerWithWeightedSampler(
         model=thinker,
         args=training_args,
         train_dataset=train_dataset,
@@ -376,6 +451,7 @@ def main():
         data_collator=data_collator,
         compute_metrics=make_compute_metrics(emotion_first_token_ids),
         preprocess_logits_for_metrics=preprocess_logits_for_metrics,
+        train_weighted_sampler=train_weighted_sampler,
     )
 
     trainer.train()

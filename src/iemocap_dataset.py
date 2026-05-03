@@ -10,6 +10,7 @@ import random
 import string
 import io
 import warnings
+from collections import Counter
 from pathlib import Path
 
 import av
@@ -729,6 +730,54 @@ def compute_iemocap_train_val_holdout_split(
         train_indices = sorted(order[val_n:])
 
     return train_indices, val_indices, holdout_indices
+
+
+def iemocap_train_subset_sample_weights(
+    train_indices,
+    raw_df: pd.DataFrame,
+    *,
+    power: float = 0.5,
+    max_ratio_to_majority: float = 40.0,
+) -> torch.Tensor:
+    """Build per-row weights for ``Subset(train_indices)`` (same order as ``train_indices``).
+
+    For each emotion class with ``n_c`` train samples and ``n_max = max_c n_c``, assign
+    every sample in that class weight::
+
+        min((n_max / n_c) ** power, max_ratio_to_majority)
+
+    ``power=0.5`` (sqrt) mildly upsamples tails; the cap prevents extreme resampling when
+    ``n_c`` is 1–3 (e.g. disgusted/other in IEMOCAP).
+
+    Args:
+        train_indices: indices into ``raw_df`` rows (same convention as ``RawIEMOCAPDataset``).
+        raw_df: ``RawIEMOCAPDataset.df`` after the same filters as training data.
+        power: exponent on ``n_max / n_c``; ``1.0`` is linear inverse-frequency style.
+        max_ratio_to_majority: clip relative boost vs the majority class per-sample weight.
+
+    Returns:
+        Float64 tensor of shape ``(len(train_indices),)`` for ``WeightedRandomSampler``.
+    """
+    train_indices = list(train_indices)
+    counts: Counter[str] = Counter()
+    for i in train_indices:
+        emo = str(raw_df.iloc[int(i)]["emotion"]).strip().lower()
+        if emo not in EMOTION2ID:
+            continue
+        counts[emo] += 1
+    if not counts:
+        raise ValueError("iemocap_train_subset_sample_weights: empty or unlabeled train_indices")
+    n_max = max(counts.values())
+    class_weight = {}
+    for emo, nc in counts.items():
+        raw_ratio = (n_max / float(nc)) ** float(power)
+        class_weight[emo] = float(min(raw_ratio, max_ratio_to_majority))
+
+    weights = []
+    for i in train_indices:
+        emo = str(raw_df.iloc[int(i)]["emotion"]).strip().lower()
+        weights.append(class_weight.get(emo, 1.0))
+    return torch.tensor(weights, dtype=torch.double)
 
 
 class CorruptedIEMOCAPDataset(Dataset):

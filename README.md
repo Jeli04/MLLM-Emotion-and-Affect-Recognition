@@ -130,3 +130,58 @@ uv run python evaluate.py \
 **Modalities:** `text`, `audio`, and/or `video`. When `video` is included, the processor loads **audio from the same video file** as the visuals (same behavior as the MELD path). Standalone `audio` without `video` uses the resolved WAV path from the manifest when present.
 
 Results are written under `results/` as `results_iemocap_{split}_{modalities}.json` (for example `results_iemocap_test_text+video.json`).
+
+### Supervised fine-tuning (SFT)
+
+Train LoRA on the thinker with `CorruptedIEMOCAPDataset` (train/val split + optional eval holdout). Corruption presets: `mild`, `medium`, `strong`. Use `--iemocap_holdout_n 0` on very small manifests (e.g. smoke CSVs).
+
+```bash
+PYTHONPATH=. uv run python -m src.finetune \
+  --dataset iemocap \
+  --manifest IEMOCAP_full_release/manifests/iemocap_utterance_labels.csv \
+  --iemocap_holdout_n 500 \
+  --iemocap_val_ratio 0.1 \
+  --model_path ./Qwen2.5-Omni-7B-GPTQ-Int4 \
+  --modalities text audio video \
+  --corruption_preset strong \
+  --num_epochs 3 \
+  --output_dir ./ckpts/iemocap_sft_strong \
+  --no_wandb
+```
+
+Adapters are saved under `<output_dir>/lora_adapter/`. A JSON record of train/val/holdout indices is written to `<output_dir>/iemocap_train_val_holdout_indices.json` when using IEMOCAP.
+
+### DPO (preference dataset + training)
+
+**1. Build the preference JSON** (runs the policy on each manifest row, then writes `dpo_samples_*.json` under `--output_dir`).
+
+```bash
+PYTHONPATH=. uv run python -m src.dpo.build_dpo_dataset \
+  --dataset iemocap \
+  --manifest IEMOCAP_full_release/manifests/iemocap_utterance_labels.csv \
+  --iemocap_eval_holdout_n 500 \
+  --split train \
+  --modalities text audio video \
+  --corruption_preset medium \
+  --model_path ./Qwen2.5-Omni-7B-GPTQ-Int4 \
+  --output_dir ./results/dpo \
+  --correct_sample_ratio 0.15 \
+  --seed 42
+```
+
+Optional: `--adapter_path ./ckpts/iemocap_sft_strong/lora_adapter` to mine preferences against an SFT checkpoint (output filename will use `_finetuned` instead of `_base`). Use `--iemocap_eval_holdout_n 0` if the manifest is tiny.
+
+**2. DPO-tune** (point `--dpo_data_path` at the `dpo_samples_*.json` path printed when step 1 finishes).
+
+```bash
+PYTHONPATH=. uv run python -m src.dpo.dpo_training \
+  --dataset iemocap \
+  --dpo_data_path ./results/dpo/dpo_samples_iemocap_train_audio+text+video_corrupt_medium_base.json \
+  --model_path ./Qwen2.5-Omni-7B-GPTQ-Int4 \
+  --modalities text audio video \
+  --num_epochs 3 \
+  --output_dir ./ckpts/iemocap_dpo \
+  --no_wandb
+```
+
+If computing reference logprobs fails with GPTQ/Marlin, try `--reference_free`. DPO adapters are saved under `<output_dir>/lora_adapter/`.

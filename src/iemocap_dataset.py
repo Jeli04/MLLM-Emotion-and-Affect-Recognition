@@ -51,6 +51,16 @@ SYSTEM_PROMPT = (
 )
 IEMOCAP_SYSTEM_PROMPT = SYSTEM_PROMPT
 
+CORRUPTION_AWARE_SYSTEM_PROMPT = (
+    "Your job as a helpful assistant is to detect what emotion is being expressed "
+    "from the inputs and identify which input modalities are corrupted. "
+    "Output exactly two lines. The first line must be one emotion word from: "
+    + ", ".join(IEMOCAP_EMOTIONS)
+    + ". The second line must be formatted exactly as: "
+    "corrupted_modalities: <comma-separated modalities or none>. "
+    "Valid modalities are text, audio, video."
+)
+
 CORRUPTION_PRESETS = {
     "mild": {
         "text_char_swap_prob": 0.02,
@@ -588,7 +598,21 @@ def corrupt_video_frames(video_path, noise_level=0.05):
     return video_path
 
 
-def build_messages(sample, modalities):
+def get_corrupted_modalities(modalities, corrupt):
+    if not corrupt:
+        return []
+    return [mod for mod in ("text", "audio", "video") if mod in modalities]
+
+
+def format_assistant_response(sample, modalities, corrupt, predict_corruption=False):
+    if not predict_corruption:
+        return sample["emotion"]
+    corrupted_modalities = get_corrupted_modalities(modalities, corrupt)
+    corrupted_text = ",".join(corrupted_modalities) if corrupted_modalities else "none"
+    return f"{sample['emotion']}\ncorrupted_modalities: {corrupted_text}"
+
+
+def build_messages(sample, modalities, corrupt=False, predict_corruption=False):
     """Build chat messages for a single sample (same format as evaluate.py)."""
     user_content = []
     has_video = "video" in modalities
@@ -600,12 +624,111 @@ def build_messages(sample, modalities):
         elif mod == "audio" and not has_video:
             user_content.append({"type": "audio", "audio": sample["audio_path"] or sample["video_path"]})
 
+    assistant_response = format_assistant_response(
+        sample, modalities, corrupt=corrupt, predict_corruption=predict_corruption,
+    )
+    system_prompt = CORRUPTION_AWARE_SYSTEM_PROMPT if predict_corruption else SYSTEM_PROMPT
+
     messages = [
-        {"role": "system", "content": [{"type": "text", "text": SYSTEM_PROMPT}]},
+        {"role": "system", "content": [{"type": "text", "text": system_prompt}]},
         {"role": "user", "content": user_content},
-        {"role": "assistant", "content": [{"type": "text", "text": sample["emotion"]}]},
+        {"role": "assistant", "content": [{"type": "text", "text": assistant_response}]},
     ]
     return messages
+
+
+def compute_iemocap_eval_holdout_indices(
+    manifest_path,
+    *,
+    holdout_n=500,
+    holdout_seed=42,
+    sessions=None,
+    split=None,
+    drop_no_agreement=True,
+):
+    """Return (holdout_indices, remaining_indices) in canonical manifest row order.
+
+    The holdout is ``min(holdout_n, n)`` indices drawn with ``random.Random(holdout_seed)``,
+    matching the 500-sample / seed-42 eval convention and ``compute_iemocap_train_val_holdout_split``.
+
+    If ``holdout_n`` is 0, holdout is empty and remaining is ``list(range(n))``.
+    """
+    base = RawIEMOCAPDataset(
+        manifest_path,
+        split=split,
+        sessions=sessions,
+        drop_no_agreement=drop_no_agreement,
+        load_audio=False,
+        max_samples=None,
+    )
+    n = len(base)
+    if n == 0:
+        raise ValueError("No IEMOCAP samples after filtering; check manifest and filters.")
+
+    holdout_n = int(holdout_n) if holdout_n is not None else 0
+    if holdout_n > 0:
+        k = min(holdout_n, n)
+        rng_h = random.Random(int(holdout_seed))
+        holdout_indices = sorted(rng_h.sample(range(n), k))
+    else:
+        holdout_indices = []
+
+    holdout_set = set(holdout_indices)
+    remaining_indices = [i for i in range(n) if i not in holdout_set]
+    return holdout_indices, remaining_indices
+
+
+def compute_iemocap_train_val_holdout_split(
+    manifest_path,
+    *,
+    holdout_n=500,
+    holdout_seed=42,
+    val_ratio=0.1,
+    split_seed=43,
+    sessions=None,
+    split=None,
+    drop_no_agreement=True,
+):
+    """Split manifest indices into train, validation, and an eval holdout set.
+
+    Uses the same row ordering as ``RawIEMOCAPDataset`` (filter, optional session/split
+    column, then stable sort). The holdout is a random sample of ``holdout_n`` indices
+    with ``holdout_seed`` (default matches common 500-sample eval settings). Train and
+    validation are disjoint from holdout; they partition the remaining indices with
+    ``val_ratio`` and ``split_seed``.
+
+    Returns:
+        train_indices, val_indices, holdout_indices (each a sorted list of ints).
+    """
+    holdout_indices, remaining = compute_iemocap_eval_holdout_indices(
+        manifest_path,
+        holdout_n=holdout_n,
+        holdout_seed=holdout_seed,
+        sessions=sessions,
+        split=split,
+        drop_no_agreement=drop_no_agreement,
+    )
+    if not remaining:
+        raise ValueError("No samples left for training after holdout; reduce holdout_n.")
+
+    val_ratio = float(val_ratio)
+    rng_s = random.Random(int(split_seed))
+    order = remaining[:]
+    rng_s.shuffle(order)
+
+    if val_ratio <= 0 or len(order) == 1:
+        train_indices = sorted(order)
+        val_indices = []
+    else:
+        # At least one train and one val when val_ratio > 0 and len >= 2.
+        val_n = min(
+            len(order) - 1,
+            max(1, int(round(len(order) * val_ratio))),
+        )
+        val_indices = sorted(order[:val_n])
+        train_indices = sorted(order[val_n:])
+
+    return train_indices, val_indices, holdout_indices
 
 
 class CorruptedIEMOCAPDataset(Dataset):
@@ -643,6 +766,7 @@ class CorruptedIEMOCAPDataset(Dataset):
         video_crop_scale=None,
         video_jpeg_quality=None,
         for_training=False,
+        predict_corruption=False,
         drop_no_agreement=True,
         max_samples=None,
     ):
@@ -690,6 +814,7 @@ class CorruptedIEMOCAPDataset(Dataset):
         self.audio_noise_level = corruption_config["audio_noise_level"]
         self.video_noise_level = corruption_config["video_noise_level"]
         self.for_training = for_training
+        self.predict_corruption = predict_corruption
 
     def __len__(self):
         return len(self.raw_dataset)
@@ -708,7 +833,12 @@ class CorruptedIEMOCAPDataset(Dataset):
                 word_drop_prob=self.text_word_drop_prob,
             )
 
-        messages = build_messages({**sample, "text": text}, self.modalities)
+        messages = build_messages(
+            {**sample, "text": text},
+            self.modalities,
+            corrupt=self.corrupt,
+            predict_corruption=self.predict_corruption,
+        )
         if self.for_training:
             rendered_text = self.processor.apply_chat_template(
                 messages, tokenize=False, add_generation_prompt=False,

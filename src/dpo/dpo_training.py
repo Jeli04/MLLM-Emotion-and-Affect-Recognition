@@ -4,6 +4,7 @@ import logging
 import os
 from pathlib import Path
 
+import librosa
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -27,20 +28,46 @@ import optimum.gptq.constants
 optimum.gptq.constants.BLOCK_PATTERNS.insert(0, "thinker.model.layers")
 
 from src.meld_dataset import (
-    SYSTEM_PROMPT,
-    collate_fn,
+    SYSTEM_PROMPT as MELD_SYSTEM_PROMPT,
+    collate_fn as meld_collate_fn,
     corrupt_audio,
     corrupt_text,
     load_audio_from_video,
     load_video_frames,
+)
+from src.iemocap_dataset import (
+    SYSTEM_PROMPT as IEMOCAP_SYSTEM_PROMPT,
+    apply_audio_corruptions,
+    apply_video_corruptions,
+    collate_fn as iemocap_collate_fn,
+    get_corruption_config,
 )
 
 
 BATCH_DIM_KEYS = {"input_ids", "attention_mask", "input_features", "feature_attention_mask"}
 
 
+def infer_dpo_corpus(dpo_data_path: str, explicit: str) -> str:
+    """Return 'meld' or 'iemocap'. Respect explicit when not 'auto'."""
+    if explicit in ("meld", "iemocap"):
+        return explicit
+    with open(dpo_data_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    if isinstance(data, dict) and str(data.get("dataset", "")).lower() == "iemocap":
+        return "iemocap"
+    return "meld"
+
+
 def parse_args():
-    parser = argparse.ArgumentParser(description="DPO-tune Qwen2.5-Omni on collected MELD preference data")
+    parser = argparse.ArgumentParser(
+        description="DPO-tune Qwen2.5-Omni on MELD or IEMOCAP preference JSON from src.dpo.build_dpo_dataset",
+    )
+    parser.add_argument(
+        "--dataset",
+        default="auto",
+        choices=["auto", "meld", "iemocap"],
+        help="Corpus layout: auto reads 'dataset' from JSON (default); override if needed.",
+    )
     parser.add_argument("--model_path", default="./ckpts/Qwen2.5-Omni-7B-GPTQ-Int4",
                         help="Path to the pretrained model")
     parser.add_argument("--dpo_data_path",
@@ -68,7 +95,7 @@ def parse_args():
     parser.add_argument("--reference_free", action="store_true",
                         help="Use reference-free preference optimization instead of disabling the LoRA adapter for reference logprobs")
     parser.add_argument("--corrupt", action="store_true", default=True,
-                        help="Apply the same random input corruption style used by supervised finetuning")
+                        help="Apply input corruption (MELD: legacy noise; IEMOCAP: preset from each JSON row)")
     parser.add_argument("--no_corrupt", dest="corrupt", action="store_false")
 
     # W&B args
@@ -85,8 +112,8 @@ def parse_args():
     return parser.parse_args()
 
 
-class MELDDPODataset(Dataset):
-    """Preference dataset built from dpo_samples_*.json.
+class DPODataset(Dataset):
+    """Preference dataset built from dpo_samples_*.json (MELD or IEMOCAP).
 
     Each item returns two model-ready examples:
       - chosen: prompt + ground-truth emotion
@@ -98,6 +125,7 @@ class MELDDPODataset(Dataset):
         dpo_data_path,
         processor,
         modalities,
+        corpus: str,
         corrupt=True,
         audio_sr=16000,
         fps=1,
@@ -109,6 +137,12 @@ class MELDDPODataset(Dataset):
         self.dpo_data_path = Path(dpo_data_path)
         self.processor = processor
         self.modalities = list(modalities)
+        self.corpus = corpus
+        if self.corpus not in ("meld", "iemocap"):
+            raise ValueError(f"corpus must be 'meld' or 'iemocap', got {self.corpus!r}")
+        self._system_prompt = (
+            IEMOCAP_SYSTEM_PROMPT if self.corpus == "iemocap" else MELD_SYSTEM_PROMPT
+        )
         self.corrupt = corrupt
         self.audio_sr = audio_sr
         self.fps = fps
@@ -117,7 +151,7 @@ class MELDDPODataset(Dataset):
         self.audio_noise_level = audio_noise_level
         self.video_noise_level = video_noise_level
 
-        with open(self.dpo_data_path) as f:
+        with open(self.dpo_data_path, encoding="utf-8") as f:
             data = json.load(f)
 
         self.samples = data["samples"] if isinstance(data, dict) else data
@@ -136,14 +170,18 @@ class MELDDPODataset(Dataset):
             elif mod == "video":
                 user_content.append({"type": "video", "video": sample["video_path"]})
             elif mod == "audio" and not has_video:
-                user_content.append({"type": "audio", "audio": sample["video_path"]})
+                if self.corpus == "iemocap":
+                    audio_ref = (sample.get("audio_path") or "").strip()
+                else:
+                    audio_ref = sample["video_path"]
+                user_content.append({"type": "audio", "audio": audio_ref})
 
         return [
-            {"role": "system", "content": [{"type": "text", "text": SYSTEM_PROMPT}]},
+            {"role": "system", "content": [{"type": "text", "text": self._system_prompt}]},
             {"role": "user", "content": user_content},
         ]
 
-    def _load_media(self, sample):
+    def _load_media_meld(self, sample):
         videos = None
         audio = None
         has_video = "video" in self.modalities
@@ -178,6 +216,53 @@ class MELDDPODataset(Dataset):
             return_tensors="pt",
         )
 
+    def _load_media_iemocap(self, sample):
+        """IEMOCAP: audio always from ``audio_path`` via librosa (no video demux)."""
+        has_video = "video" in self.modalities
+        has_audio = "audio" in self.modalities
+        preset = sample.get("corruption_preset") or "medium"
+        corrupt_row = bool(sample.get("corrupt", True)) and self.corrupt
+        config = get_corruption_config(preset) if corrupt_row else None
+
+        videos = None
+        audio = None
+
+        if has_video:
+            try:
+                frames = load_video_frames(sample["video_path"], fps=self.fps)
+            except Exception:
+                frames = np.zeros((2, 224, 224, 3), dtype=np.uint8)
+            if corrupt_row and config is not None:
+                frames = apply_video_corruptions(frames, config)
+            videos = [frames]
+
+        if has_audio:
+            ap = (sample.get("audio_path") or "").strip()
+            try:
+                waveform, sr = librosa.load(ap, sr=self.audio_sr, mono=True)
+                waveform = waveform.astype(np.float32)
+            except Exception:
+                waveform = np.zeros(self.audio_sr, dtype=np.float32)
+                sr = self.audio_sr
+            if corrupt_row and config is not None:
+                waveform = apply_audio_corruptions(waveform, sr, config)
+            audio = [waveform]
+
+        return dict(
+            videos=videos,
+            audio=audio,
+            use_audio_in_video=has_video and has_audio,
+            fps=self.fps,
+            do_sample_frames=False,
+            padding=True,
+            return_tensors="pt",
+        )
+
+    def _load_media(self, sample):
+        if self.corpus == "iemocap":
+            return self._load_media_iemocap(sample)
+        return self._load_media_meld(sample)
+
     def _encode_response(self, prompt_messages, response_text, processor_kwargs, prompt_len):
         messages = prompt_messages + [
             {"role": "assistant", "content": [{"type": "text", "text": response_text}]}
@@ -197,12 +282,24 @@ class MELDDPODataset(Dataset):
     def __getitem__(self, idx):
         sample = self.samples[idx]
         text = sample["text"]
-        if self.corrupt and "text" in self.modalities:
-            text = corrupt_text(
-                text,
-                char_swap_prob=self.text_char_swap_prob,
-                word_drop_prob=self.text_word_drop_prob,
-            )
+        corrupt_row = bool(sample.get("corrupt", True)) if self.corpus == "iemocap" else True
+        apply_corruption = self.corrupt and corrupt_row
+
+        if apply_corruption and "text" in self.modalities:
+            if self.corpus == "iemocap":
+                preset = sample.get("corruption_preset") or "medium"
+                cfg = get_corruption_config(preset)
+                text = corrupt_text(
+                    text,
+                    char_swap_prob=cfg["text_char_swap_prob"],
+                    word_drop_prob=cfg["text_word_drop_prob"],
+                )
+            else:
+                text = corrupt_text(
+                    text,
+                    char_swap_prob=self.text_char_swap_prob,
+                    word_drop_prob=self.text_word_drop_prob,
+                )
 
         prompt_messages = self._build_prompt_messages(sample, text)
         prompt_rendered = self.processor.apply_chat_template(
@@ -222,17 +319,22 @@ class MELDDPODataset(Dataset):
         }
 
 
+# Backward-compatible name for older references / scripts.
+MELDDPODataset = DPODataset
+
+
 class DPODataCollator:
-    def __init__(self, pad_token_id):
+    def __init__(self, collate_fn_impl, pad_token_id):
+        self.collate_fn_impl = collate_fn_impl
         self.pad_token_id = pad_token_id
 
     def __call__(self, features):
-        chosen = collate_fn(
+        chosen = self.collate_fn_impl(
             [feature["chosen"] for feature in features],
             pad_token_id=self.pad_token_id,
             padding_side="right",
         )
-        rejected = collate_fn(
+        rejected = self.collate_fn_impl(
             [feature["rejected"] for feature in features],
             pad_token_id=self.pad_token_id,
             padding_side="right",
@@ -329,8 +431,11 @@ def maybe_split_dataset(dataset, eval_ratio, seed):
 def main():
     args = parse_args()
     set_seed(args.seed)
+    corpus = infer_dpo_corpus(args.dpo_data_path, args.dataset)
+    collate_fn_impl = iemocap_collate_fn if corpus == "iemocap" else meld_collate_fn
+
     print(
-        f"DPO training with data={args.dpo_data_path}, modalities={args.modalities}, "
+        f"DPO training corpus={corpus} data={args.dpo_data_path}, modalities={args.modalities}, "
         f"corrupt={args.corrupt}, beta={args.beta}, wandb={args.wandb}, seed={args.seed}"
     )
 
@@ -371,10 +476,11 @@ def main():
     thinker.gradient_checkpointing_enable()
     thinker.print_trainable_parameters()
 
-    dataset = MELDDPODataset(
+    dataset = DPODataset(
         args.dpo_data_path,
         processor=processor,
         modalities=tuple(args.modalities),
+        corpus=corpus,
         corrupt=args.corrupt,
     )
     train_dataset, eval_dataset = maybe_split_dataset(dataset, args.eval_ratio, args.seed)
@@ -410,7 +516,7 @@ def main():
         args=training_args,
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
-        data_collator=DPODataCollator(processor.tokenizer.pad_token_id),
+        data_collator=DPODataCollator(collate_fn_impl, processor.tokenizer.pad_token_id),
         beta=args.beta,
         reference_free=args.reference_free,
     )

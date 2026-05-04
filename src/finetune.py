@@ -53,6 +53,13 @@ def parse_args():
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=8)
     parser.add_argument("--learning_rate", type=float, default=1e-4)
+    parser.add_argument("--max_grad_norm", type=float, default=1.0,
+                        help="Gradient clipping threshold (HF default 1.0). Lower "
+                             "values (e.g. 0.5) help with fp16 instability.")
+    parser.add_argument("--precision", choices=["fp16", "bf16"], default="bf16",
+                        help="Mixed-precision dtype. bf16 has wider dynamic range "
+                             "than fp16 and doesn't need a loss scaler; use fp16 "
+                             "only if your GPU lacks bf16 support.")
     parser.add_argument("--lora_r", type=int, default=16)
     parser.add_argument("--lora_alpha", type=int, default=32)
     parser.add_argument("--lora_dropout", type=float, default=0.05)
@@ -299,7 +306,7 @@ def main():
     model = Qwen2_5OmniForConditionalGeneration.from_pretrained(
         args.model_path,
         device_map="auto",
-        torch_dtype=torch.float16,
+        torch_dtype=dtype,
     )
 
     lora_config = LoraConfig(
@@ -358,7 +365,9 @@ def main():
         save_total_limit=3,
         eval_strategy="steps",
         eval_steps=args.save_steps,
-        fp16=True,
+        fp16=(args.precision == "fp16"),
+        bf16=(args.precision == "bf16"),
+        max_grad_norm=args.max_grad_norm,
         report_to="wandb" if args.wandb else "none",
         run_name=run_name,
         remove_unused_columns=False,

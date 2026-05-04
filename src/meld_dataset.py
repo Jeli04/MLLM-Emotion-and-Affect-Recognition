@@ -270,10 +270,12 @@ class RawMELDDataset(Dataset):
         return sample
 
 
-def load_video_frames(video_path, fps=1, temporal_patch_size=2):
+def load_video_frames(video_path, fps=1, temporal_patch_size=2, max_frames=16):
     """Decode a video file with decord and sample frames at target fps.
 
     Rounds the frame count to a multiple of temporal_patch_size (2 for Qwen2.5-Omni).
+    Caps total frames at `max_frames` so a single long clip can't blow up VRAM
+    via thousands of vision tokens. Set max_frames=None to disable the cap.
     Returns a [N, H, W, C] uint8 numpy array.
     """
     video_path = _ensure_media_file(video_path)
@@ -283,6 +285,10 @@ def load_video_frames(video_path, fps=1, temporal_patch_size=2):
     num_frames = max(1, math.floor(total_frames / video_fps * fps))
     num_frames = max(temporal_patch_size, round(num_frames / temporal_patch_size) * temporal_patch_size)
     num_frames = min(num_frames, total_frames)
+    if max_frames is not None:
+        # Round cap down to a multiple of temporal_patch_size
+        cap = (max_frames // temporal_patch_size) * temporal_patch_size
+        num_frames = min(num_frames, cap)
     indices = np.linspace(0, total_frames - 1, num_frames, dtype=int)
     return vr.get_batch(indices).asnumpy()
 
@@ -639,8 +645,8 @@ def build_messages(sample, modalities, corrupt=False, predict_corruption=False):
 class CorruptedMELDDataset(Dataset):
     """MELD dataset with optional corruption applied to raw modality data.
 
-    Loads raw video frames, audio waveforms, and text, applies corruption,
-    then runs the processor to produce model-ready inputs.
+    Loads raw video frames, audio waveforms, and text, then runs the
+    processor to produce model-ready inputs.
 
     When `distill=True`, __getitem__ returns a paired {"full": ..., "mask": ...}
     dict unless `include_full_branch=False`. The full item uses all modalities;
@@ -766,6 +772,10 @@ class CorruptedMELDDataset(Dataset):
                 messages[:-1], tokenize=False, add_generation_prompt=True,
             )
         else:
+            # messages[-1] is the assistant turn carrying the ground-truth
+            # label. Drop it before rendering so the model generates from the
+            # prompt without seeing the answer. add_generation_prompt=True
+            # appends the marker where generation begins.
             rendered_text = self.processor.apply_chat_template(
                 messages[:-1], tokenize=False, add_generation_prompt=True,
             )
@@ -838,13 +848,13 @@ class CorruptedMELDDataset(Dataset):
         waveform = None
         if "video" in self.modalities:
             try:
-                frames = self._load_video_frames(sample["video_path"], self.fps)
+                clean_frames = self._load_video_frames(sample["video_path"], self.fps)
             except Exception:
                 # 2 black frames (minimum for temporal_patch_size=2), 224×224 RGB
                 frames = np.zeros((2, 224, 224, 3), dtype=np.uint8)
         if "audio" in self.modalities:
             try:
-                waveform, _ = load_audio_from_video(sample["video_path"], target_sr=self.audio_sr)
+                clean_waveform, _ = load_audio_from_video(sample["video_path"], target_sr=self.audio_sr)
             except Exception:
                 # 1 second of silence at the target sample rate
                 waveform = np.zeros(self.audio_sr, dtype=np.float32)

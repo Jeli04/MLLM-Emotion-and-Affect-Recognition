@@ -97,28 +97,43 @@ def eval_collate(batch, pad_token_id):
     return collated
 
 
+def get_cuda_eval_device():
+    if not torch.cuda.is_available():
+        raise RuntimeError(
+            "CUDA is not available, but the GPTQ eval model must run on GPU. "
+            "Check the Slurm GPU allocation/CUDA_VISIBLE_DEVICES for this job."
+        )
+    return f"cuda:{torch.cuda.current_device()}"
+
+
 def main():
     args = parse_args()
     set_seed(args.seed)
+    eval_device = get_cuda_eval_device()
     print(
         f"Evaluating on split='{args.split}' with modalities={args.modalities}, "
         f"corrupt={args.corrupt}, corruption_preset={args.corruption_preset}, "
-        f"data_subset_percent={args.data_subset_percent:g}, seed={args.seed}"
+        f"data_subset_percent={args.data_subset_percent:g}, seed={args.seed}, "
+        f"device={eval_device}"
     )
 
     processor = Qwen2_5OmniProcessor.from_pretrained(args.model_path)
     model = Qwen2_5OmniForConditionalGeneration.from_pretrained(
         args.model_path,
-        device_map="auto",
+        device_map={"": eval_device},
         enable_audio_output=False,
     )
     if args.adapter_path is not None:
         print(f"Loading LoRA adapter from {args.adapter_path}...")
-        model.thinker = PeftModel.from_pretrained(model.thinker, args.adapter_path)
+        model.thinker = PeftModel.from_pretrained(
+            model.thinker,
+            args.adapter_path,
+            torch_device=eval_device,
+        )
 
     model.eval()
 
-    first_device = next(model.parameters()).device
+    first_device = torch.device(eval_device)
 
     dataset = CorruptedMELDDataset(
         args.data_root,

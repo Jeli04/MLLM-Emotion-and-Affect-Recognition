@@ -2,10 +2,13 @@ import argparse
 import faulthandler
 import logging
 import os
+from collections import Counter
 from functools import partial
 
 import numpy as np
 import torch
+import torch.nn as nn
+from sklearn.metrics import accuracy_score, f1_score
 from transformers import (
     Qwen2_5OmniForConditionalGeneration,
     Qwen2_5OmniProcessor,
@@ -69,6 +72,9 @@ def parse_args():
                         help="Train the assistant to output emotion plus corrupted input modalities")
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed for python, numpy, torch, and HF Trainer")
+    parser.add_argument("--class_weighted_loss", action="store_true", default=False,
+                        help="Scale per-sample CE loss by inverse train-frequency of the "
+                             "ground-truth emotion to combat MELD's neutral imbalance")
 
     # W&B args
     parser.add_argument("--wandb", dest="wandb", action="store_true", default=True,
@@ -141,43 +147,120 @@ def preprocess_logits_for_metrics(logits, labels):
     return logits.argmax(dim=-1)
 
 
+class WeightedLossTrainer(Trainer):
+    """Trainer that scales each sample's mean CE loss by a per-class weight.
+
+    The class is identified from the first non-(-100) token in `labels`, which
+    in this dataset is always the emotion's first subword token.
+    """
+
+    def __init__(self, *args, token_id_to_weight=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.token_id_to_weight = dict(token_id_to_weight or {})
+
+    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+        labels = inputs["labels"]
+        outputs = model(**inputs)
+        logits = outputs.logits
+
+        shift_logits = logits[..., :-1, :].contiguous()
+        shift_labels = labels[..., 1:].contiguous()
+
+        loss_fct = nn.CrossEntropyLoss(reduction="none", ignore_index=-100)
+        per_tok = loss_fct(
+            shift_logits.reshape(-1, shift_logits.size(-1)).float(),
+            shift_labels.reshape(-1),
+        ).view(shift_labels.shape)
+
+        valid = (shift_labels != -100).to(per_tok.dtype)
+        denom = valid.sum(dim=1).clamp(min=1.0)
+        per_sample_loss = (per_tok * valid).sum(dim=1) / denom
+
+        sample_weights = torch.ones_like(per_sample_loss)
+        for i in range(labels.size(0)):
+            resp_idx = (labels[i] != -100).nonzero(as_tuple=True)[0]
+            if resp_idx.numel() == 0:
+                continue
+            first_tok = int(labels[i, resp_idx[0]].item())
+            w = self.token_id_to_weight.get(first_tok)
+            if w is not None:
+                sample_weights[i] = w
+
+        loss = (per_sample_loss * sample_weights).mean()
+        return (loss, outputs) if return_outputs else loss
+
+
+def compute_inverse_freq_weights(emotion_counts):
+    """Return {emotion: weight} with w_c = N / (K * n_c), the sklearn 'balanced' rule."""
+    counts = np.array([emotion_counts[e] for e in EMOTION2ID], dtype=np.float64)
+    if (counts <= 0).any():
+        raise ValueError(f"Found a class with 0 samples: {dict(zip(EMOTION2ID, counts))}")
+    N = counts.sum()
+    K = len(counts)
+    weights = N / (K * counts)
+    return {emotion: float(weights[i]) for i, emotion in enumerate(EMOTION2ID)}
+
+
 def make_compute_metrics(emotion_first_token_ids):
     """Return a compute_metrics closure over the per-emotion first-token IDs.
 
     emotion_first_token_ids: dict mapping emotion name → token ID of its first
     subword (e.g. {"neutral": 19282, ...}), built from the processor tokenizer.
+
+    Reports overall accuracy, macro/weighted F1, and per-class accuracy + F1.
     """
     id2emotion = {v: k for k, v in emotion_first_token_ids.items()}
+    label_names = sorted(emotion_first_token_ids.keys())
 
     def compute_metrics(eval_pred):
         pred_tokens, label_ids = eval_pred
         # pred_tokens: [n, seq_len] — argmax over vocab at each position
         # label_ids:   [n, seq_len] — -100 for prompt/padding, real token elsewhere
 
-        per_class_correct = {e: 0 for e in emotion_first_token_ids}
-        per_class_total   = {e: 0 for e in emotion_first_token_ids}
-
+        y_true = []
+        y_pred = []
         for pred_seq, label_seq in zip(pred_tokens, label_ids):
             resp = np.where(label_seq != -100)[0]
             if len(resp) == 0 or resp[0] == 0:
                 continue
             first_pos = int(resp[0])
-            true_tok  = int(label_seq[first_pos])
+            true_tok = int(label_seq[first_pos])
             # logits[j] predicts the token at position j+1, so the prediction
             # for the first response token lives at position first_pos - 1.
-            pred_tok  = int(pred_seq[first_pos - 1])
+            pred_tok = int(pred_seq[first_pos - 1])
 
             true_emotion = id2emotion.get(true_tok)
             if true_emotion is None:
                 continue
-            per_class_total[true_emotion] += 1
-            if pred_tok == true_tok:
-                per_class_correct[true_emotion] += 1
+            y_true.append(true_emotion)
+            # Map non-emotion predictions to a unique sentinel so they count as wrong
+            y_pred.append(id2emotion.get(pred_tok, f"__other_{pred_tok}"))
 
-        total   = sum(per_class_total.values())
-        correct = sum(per_class_correct.values())
-        metrics = {"accuracy": correct / total if total > 0 else 0.0}
-        for emotion in emotion_first_token_ids:
+        if not y_true:
+            return {"accuracy": 0.0, "macro_f1": 0.0, "weighted_f1": 0.0}
+
+        metrics = {
+            "accuracy": accuracy_score(y_true, y_pred),
+            "macro_f1": f1_score(
+                y_true, y_pred, labels=label_names, average="macro", zero_division=0,
+            ),
+            "weighted_f1": f1_score(
+                y_true, y_pred, labels=label_names, average="weighted", zero_division=0,
+            ),
+        }
+        per_class_f1 = f1_score(
+            y_true, y_pred, labels=label_names, average=None, zero_division=0,
+        )
+        for emotion, score in zip(label_names, per_class_f1):
+            metrics[f"f1_{emotion}"] = float(score)
+
+        per_class_correct = {e: 0 for e in label_names}
+        per_class_total = {e: 0 for e in label_names}
+        for t, p in zip(y_true, y_pred):
+            per_class_total[t] += 1
+            if t == p:
+                per_class_correct[t] += 1
+        for emotion in label_names:
             n = per_class_total[emotion]
             metrics[f"acc_{emotion}"] = (
                 per_class_correct[emotion] / n if n > 0 else 0.0
@@ -284,7 +367,25 @@ def main():
         data_seed=args.seed,
     )
 
-    trainer = Trainer(
+    trainer_cls = Trainer
+    extra_trainer_kwargs = {}
+    if args.class_weighted_loss:
+        emotion_counts = Counter(train_dataset.raw_dataset.df["Emotion"].str.lower())
+        missing = set(EMOTION2ID) - set(emotion_counts)
+        if missing:
+            raise ValueError(f"Train split is missing emotions: {missing}")
+        class_weights = compute_inverse_freq_weights(emotion_counts)
+        token_id_to_weight = {
+            emotion_first_token_ids[e]: w for e, w in class_weights.items()
+        }
+        print("Class-weighted loss enabled. Per-emotion weights:")
+        for emotion in EMOTION2ID:
+            print(f"  {emotion:9s}  count={emotion_counts[emotion]:5d}  "
+                  f"weight={class_weights[emotion]:.4f}")
+        trainer_cls = WeightedLossTrainer
+        extra_trainer_kwargs["token_id_to_weight"] = token_id_to_weight
+
+    trainer = trainer_cls(
         model=thinker,
         args=training_args,
         train_dataset=train_dataset,
@@ -292,6 +393,7 @@ def main():
         data_collator=data_collator,
         compute_metrics=make_compute_metrics(emotion_first_token_ids),
         preprocess_logits_for_metrics=preprocess_logits_for_metrics,
+        **extra_trainer_kwargs,
     )
 
     resume_from_checkpoint = resolve_resume_from_checkpoint(

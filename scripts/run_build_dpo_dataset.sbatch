@@ -5,7 +5,7 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=120G
-#SBATCH --gres=gpu:1
+#SBATCH --gres=gpu:rtxa6000:1
 #SBATCH --time=2-00:00:00
 #SBATCH --output=slurm_logs/%j.out
 #SBATCH --error=slurm_logs/%j.err
@@ -27,10 +27,10 @@ PYTHONPATH=. python -m src.dpo.build_dpo_dataset \
     --split train \
     --data_root /project2/robinjia_875/lijc/data/MELD.Raw \
     --model_path ./ckpts/Qwen2.5-Omni-7B-GPTQ-Int4 \
-    --adapter_path ./ckpts/finetuned_distill_clean_teacher_base_lk0.03_medium/lora_adapter \
-    --correct_sample_ratio 0.2 \
+    --adapter_path ./ckpts/finetuned_corrupt_strong_weighted/lora_adapter \
+    --correct_sample_ratio 0.0 \
     --corruption_preset strong \
-    --output_name_suffix student_teacher \
+    --output_name_suffix finetune_weighted \
     --corrupt \
     --modalities text audio video \
     "$@"

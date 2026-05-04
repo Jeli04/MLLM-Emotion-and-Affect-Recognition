@@ -9,7 +9,8 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from peft import LoraConfig, PeftModel, TaskType, get_peft_model
-from torch.utils.data import Dataset, random_split
+from sklearn.metrics import accuracy_score, f1_score
+from torch.utils.data import Dataset, Subset, random_split
 from transformers import (
     Qwen2_5OmniForConditionalGeneration,
     Qwen2_5OmniProcessor,
@@ -31,6 +32,7 @@ optimum.gptq.constants.BLOCK_PATTERNS.insert(0, "thinker.model.layers")
 
 from src.meld_dataset import (
     CORRUPTION_PRESET_NAMES,
+    EMOTION2ID,
     SYSTEM_PROMPT,
     apply_audio_corruptions,
     apply_video_corruptions,
@@ -43,6 +45,7 @@ from src.meld_dataset import (
 
 
 BATCH_DIM_KEYS = {"input_ids", "attention_mask", "input_features", "feature_attention_mask"}
+VALID_EMOTIONS = sorted(EMOTION2ID.keys())
 
 
 def parse_args():
@@ -70,13 +73,13 @@ def parse_args():
     parser.add_argument("--base_reference", action="store_true", default=False,
                         help="Use the base model with adapters disabled for reference "
                              "logprobs, even when --adapter_path is provided.")
-    parser.add_argument("--num_epochs", type=int, default=3)
+    parser.add_argument("--num_epochs", type=int, default=1)
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=8)
-    parser.add_argument("--learning_rate", type=float, default=5e-5)
+    parser.add_argument("--learning_rate", type=float, default=5e-6)
     parser.add_argument("--beta", type=float, default=0.1,
                         help="DPO inverse-temperature parameter")
-    parser.add_argument("--eval_ratio", type=float, default=0.0,
+    parser.add_argument("--eval_ratio", type=float, default=0.1,
                         help="Optional fraction of DPO data held out for eval")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--lora_r", type=int, default=16)
@@ -287,7 +290,7 @@ class MELDDPODataset(Dataset):
         result["prompt_len"] = prompt_len
         return result
 
-    def __getitem__(self, idx):
+    def _build_prompt(self, idx):
         sample = self.samples[idx]
         text = sample["text"]
         if self.corrupt and "text" in self.modalities:
@@ -304,7 +307,10 @@ class MELDDPODataset(Dataset):
         processor_kwargs = self._load_media(sample)
         prompt_inputs = self.processor(text=prompt_rendered, **processor_kwargs)
         prompt_len = int(prompt_inputs["input_ids"].shape[-1])
+        return sample, prompt_messages, processor_kwargs, prompt_len
 
+    def __getitem__(self, idx):
+        sample, prompt_messages, processor_kwargs, prompt_len = self._build_prompt(idx)
         return {
             "chosen": self._encode_response(
                 prompt_messages, sample["chosen"], processor_kwargs, prompt_len,
@@ -312,6 +318,18 @@ class MELDDPODataset(Dataset):
             "rejected": self._encode_response(
                 prompt_messages, sample["rejected"], processor_kwargs, prompt_len,
             ),
+        }
+
+    def build_classification_inputs(self, idx, candidate_emotions):
+        """Encode prompt + each candidate emotion for argmax-logp classification."""
+        sample, prompt_messages, processor_kwargs, prompt_len = self._build_prompt(idx)
+        candidates = [
+            self._encode_response(prompt_messages, emotion, processor_kwargs, prompt_len)
+            for emotion in candidate_emotions
+        ]
+        return {
+            "candidates": candidates,
+            "ground_truth": sample["ground_truth"],
         }
 
 
@@ -461,6 +479,98 @@ class PreferenceTrainer(Trainer):
             }
         return loss
 
+    def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys=None):
+        """Evaluate DPO batches through compute_loss instead of model.forward."""
+        inputs = self._prepare_inputs(inputs)
+        with torch.no_grad(), self.compute_loss_context_manager():
+            loss = self.compute_loss(model, inputs)
+        return loss.detach().mean(), None, None
+
+    @staticmethod
+    def _unwrap_eval_dataset(eval_dataset):
+        if isinstance(eval_dataset, Subset):
+            return eval_dataset.dataset, list(eval_dataset.indices)
+        return eval_dataset, list(range(len(eval_dataset)))
+
+    def _classification_eval(self, eval_dataset, metric_key_prefix="eval"):
+        """Score each emotion candidate per eval prompt and compute accuracy + F1.
+
+        Uses length-normalized response logp (sum / num response tokens) so that
+        emotions tokenizing to different lengths are compared fairly.
+        """
+        if eval_dataset is None or len(eval_dataset) == 0:
+            return {}
+
+        base_dataset, indices = self._unwrap_eval_dataset(eval_dataset)
+        if not hasattr(base_dataset, "build_classification_inputs"):
+            return {}
+
+        pad_token_id = base_dataset.processor.tokenizer.pad_token_id
+        model = self.model
+        device = next(model.parameters()).device
+
+        predictions = []
+        labels = []
+
+        was_training = model.training
+        model.eval()
+        self._set_adapter(model, self.policy_adapter_name, trainable=False)
+        try:
+            for idx in indices:
+                data = base_dataset.build_classification_inputs(idx, VALID_EMOTIONS)
+                scores = []
+                for cand in data["candidates"]:
+                    batch = collate_fn(
+                        [cand], pad_token_id=pad_token_id, padding_side="right",
+                    )
+                    batch = {
+                        k: (v.to(device) if isinstance(v, torch.Tensor) else v)
+                        for k, v in batch.items()
+                    }
+                    with torch.no_grad():
+                        logp = self._forward_logps(model, batch)
+                    n_resp = (batch["labels"][:, 1:] != -100).sum().clamp(min=1)
+                    scores.append((logp.sum() / n_resp).item())
+                pred = VALID_EMOTIONS[int(np.argmax(scores))]
+                predictions.append(pred)
+                labels.append(data["ground_truth"])
+        finally:
+            if was_training:
+                model.train()
+            self._set_adapter(model, self.policy_adapter_name, trainable=True)
+
+        if not predictions:
+            return {}
+
+        return {
+            f"{metric_key_prefix}_classification_n": float(len(predictions)),
+            f"{metric_key_prefix}_accuracy": accuracy_score(labels, predictions),
+            f"{metric_key_prefix}_macro_f1": f1_score(
+                labels, predictions, labels=VALID_EMOTIONS,
+                average="macro", zero_division=0,
+            ),
+            f"{metric_key_prefix}_weighted_f1": f1_score(
+                labels, predictions, labels=VALID_EMOTIONS,
+                average="weighted", zero_division=0,
+            ),
+        }
+
+    def evaluate(self, eval_dataset=None, ignore_keys=None, metric_key_prefix="eval"):
+        metrics = super().evaluate(
+            eval_dataset=eval_dataset,
+            ignore_keys=ignore_keys,
+            metric_key_prefix=metric_key_prefix,
+        )
+        eval_ds = eval_dataset if eval_dataset is not None else self.eval_dataset
+        if eval_ds is not None and len(eval_ds) > 0:
+            cls_metrics = self._classification_eval(
+                eval_ds, metric_key_prefix=metric_key_prefix,
+            )
+            if cls_metrics:
+                self.log(cls_metrics)
+                metrics.update(cls_metrics)
+        return metrics
+
 
 def maybe_split_dataset(dataset, eval_ratio, seed):
     if eval_ratio <= 0 or len(dataset) < 2:
@@ -502,7 +612,8 @@ def main():
     print(
         f"DPO training with data={args.dpo_data_path}, modalities={args.modalities}, "
         f"corrupt={args.corrupt}, corruption_preset={args.corruption_preset or 'from_data_or_medium'}, "
-        f"beta={args.beta}, wandb={args.wandb}, seed={args.seed}, "
+        f"learning_rate={args.learning_rate}, num_epochs={args.num_epochs}, "
+        f"eval_ratio={args.eval_ratio}, beta={args.beta}, wandb={args.wandb}, seed={args.seed}, "
         f"max_audio_seconds={args.max_audio_seconds}, max_video_frames={args.max_video_frames}, "
         f"torch_empty_cache_steps={args.torch_empty_cache_steps}, "
         f"adapter_path={args.adapter_path}, reference_adapter_path={reference_adapter_path}, "
@@ -627,6 +738,21 @@ def main():
         True if args.resume_from_checkpoint == "auto" else args.resume_from_checkpoint
     )
     trainer.train(resume_from_checkpoint=resume_from_checkpoint)
+
+    if eval_dataset is not None:
+        eval_metrics = trainer.evaluate(metric_key_prefix="eval")
+        metrics_path = os.path.join(args.output_dir, "eval_metrics.json")
+        os.makedirs(args.output_dir, exist_ok=True)
+        with open(metrics_path, "w") as f:
+            json.dump(eval_metrics, f, indent=2)
+
+        print("\nFinal DPO eval metrics:")
+        for key in ("eval_loss", "eval_accuracy", "eval_macro_f1", "eval_weighted_f1"):
+            if key in eval_metrics:
+                print(f"  {key}: {eval_metrics[key]:.4f}")
+        print(f"Eval metrics saved to {metrics_path}")
+    else:
+        print("No DPO eval split was created; set --eval_ratio > 0 to report accuracy/F1.")
 
     adapter_dir = os.path.join(args.output_dir, "lora_adapter")
     thinker.set_adapter(policy_adapter_name)

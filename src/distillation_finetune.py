@@ -2,6 +2,7 @@ import argparse
 import faulthandler
 import logging
 import os
+from collections import Counter
 from contextlib import nullcontext
 from functools import partial
 
@@ -26,7 +27,12 @@ logging.getLogger().addFilter(
 import optimum.gptq.constants
 optimum.gptq.constants.BLOCK_PATTERNS.insert(0, "thinker.model.layers")
 
-from src.meld_dataset import CORRUPTION_PRESET_NAMES, CorruptedMELDDataset, collate_fn
+from src.finetune import (
+    compute_inverse_freq_weights,
+    make_compute_metrics,
+    preprocess_logits_for_metrics,
+)
+from src.meld_dataset import CORRUPTION_PRESET_NAMES, CorruptedMELDDataset, EMOTION2ID, collate_fn
 
 
 def set_adapter_trainability(model, adapter_name, trainable):
@@ -54,6 +60,7 @@ class StudentTeacherTrainer(Trainer):
         student_adapter_name="default",
         teacher_adapter_name=None,
         base_teacher=False,
+        token_id_to_weight=None,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -68,6 +75,51 @@ class StudentTeacherTrainer(Trainer):
         self.student_adapter_name = student_adapter_name
         self.teacher_adapter_name = teacher_adapter_name
         self.base_teacher = base_teacher
+        self.token_id_to_weight = dict(token_id_to_weight or {})
+
+    def _sample_weights(self, labels):
+        """Return [B] tensor of per-sample weights from each row's first response token."""
+        B = labels.size(0)
+        device = labels.device
+        weights = torch.ones(B, device=device, dtype=torch.float32)
+        if not self.token_id_to_weight:
+            return weights
+        for i in range(B):
+            resp_idx = (labels[i] != -100).nonzero(as_tuple=True)[0]
+            if resp_idx.numel() == 0:
+                continue
+            first_tok = int(labels[i, resp_idx[0]].item())
+            w = self.token_id_to_weight.get(first_tok)
+            if w is not None:
+                weights[i] = w
+        return weights
+
+    def _weighted_response_ce(self, logits, labels):
+        """CE over response tokens, weighted per-sample by class weight if enabled."""
+        shift_logits = logits[..., :-1, :]
+        shift_labels = labels[..., 1:]
+        keep = shift_labels != -100
+        if keep.sum() == 0:
+            return torch.zeros((), device=logits.device, dtype=logits.dtype)
+
+        selected_logits = shift_logits[keep].float()
+        selected_labels = shift_labels[keep]
+
+        if not self.token_id_to_weight:
+            return F.cross_entropy(selected_logits, selected_labels)
+
+        per_tok_ce = F.cross_entropy(
+            shift_logits.reshape(-1, shift_logits.size(-1)).float(),
+            shift_labels.reshape(-1),
+            reduction="none",
+            ignore_index=-100,
+        ).view(shift_labels.shape)
+        valid = keep.to(per_tok_ce.dtype)
+        denom = valid.sum(dim=1).clamp(min=1.0)
+        per_sample_loss = (per_tok_ce * valid).sum(dim=1) / denom
+
+        sample_weights = self._sample_weights(labels).to(per_sample_loss.dtype)
+        return (per_sample_loss * sample_weights).mean()
 
     def _set_adapter(self, model, adapter_name, trainable=None):
         if adapter_name is not None and hasattr(model, "set_adapter"):
@@ -155,14 +207,16 @@ class StudentTeacherTrainer(Trainer):
         if student_resp.numel() == 0:
             mask_ce_loss = torch.zeros((), device=mask_out.logits.device, dtype=mask_out.logits.dtype)
         else:
-            mask_ce_loss = F.cross_entropy(student_resp.float(), student_labels)
+            mask_ce_loss = self._weighted_response_ce(
+                mask_out.logits, mask_inputs["labels"],
+            )
 
         if full_student_out is not None:
             full_resp, full_labels = response_logits_and_labels(
                 full_student_out.logits, full_inputs["labels"],
             )
             full_ce_loss = (
-                F.cross_entropy(full_resp.float(), full_labels)
+                self._weighted_response_ce(full_student_out.logits, full_inputs["labels"])
                 if full_resp.numel() > 0
                 else torch.zeros((), device=mask_ce_loss.device, dtype=mask_ce_loss.dtype)
             )
@@ -311,6 +365,10 @@ def parse_args():
                              "(produced by scripts/precompute_teacher_logits.py). When "
                              "set, the live teacher forward is skipped and cached "
                              "logits are used for KL.")
+    parser.add_argument("--class_weighted_loss", action="store_true", default=False,
+                        help="Scale per-sample CE (full and mask) by inverse train-frequency "
+                             "of the ground-truth emotion to combat MELD's neutral imbalance. "
+                             "KL is left unweighted.")
 
     # W&B args
     parser.add_argument("--wandb", dest="wandb", action="store_true", default=True,
@@ -449,6 +507,26 @@ def main():
         args.data_root, split="dev", teacher_logits_dir=val_logits_dir, **common,
     )
 
+    emotion_first_token_ids = {
+        emotion: processor.tokenizer(emotion, add_special_tokens=False)["input_ids"][0]
+        for emotion in EMOTION2ID
+    }
+
+    token_id_to_weight = None
+    if args.class_weighted_loss:
+        emotion_counts = Counter(train_dataset.raw_dataset.df["Emotion"].str.lower())
+        missing = set(EMOTION2ID) - set(emotion_counts)
+        if missing:
+            raise ValueError(f"Train split is missing emotions: {missing}")
+        class_weights = compute_inverse_freq_weights(emotion_counts)
+        token_id_to_weight = {
+            emotion_first_token_ids[e]: w for e, w in class_weights.items()
+        }
+        print("Class-weighted CE enabled. Per-emotion weights:")
+        for emotion in EMOTION2ID:
+            print(f"  {emotion:9s}  count={emotion_counts[emotion]:5d}  "
+                  f"weight={class_weights[emotion]:.4f}")
+
     data_collator = partial(
         collate_fn,
         pad_token_id=processor.tokenizer.pad_token_id,
@@ -484,6 +562,8 @@ def main():
         train_dataset=train_dataset,
         eval_dataset=val_dataset,
         data_collator=data_collator,
+        compute_metrics=make_compute_metrics(emotion_first_token_ids),
+        preprocess_logits_for_metrics=preprocess_logits_for_metrics,
         lambda_kl=args.lambda_kl,
         distill_temperature=args.distill_temperature,
         full_ce_weight=args.full_ce_weight,
@@ -491,6 +571,7 @@ def main():
         student_adapter_name="default",
         teacher_adapter_name=teacher_adapter_name,
         base_teacher=args.base_teacher and teacher_adapter_name is None,
+        token_id_to_weight=token_id_to_weight,
     )
 
     resume_from_checkpoint = resolve_resume_from_checkpoint(

@@ -1,13 +1,3 @@
-"""
-Corruption pipeline lifted from the main branch's `src/meld_dataset.py`.
-
-This is a self-contained copy so the AffectGPT preprocessing scripts can be
-run from environments that don't have the full main-branch checkout. If the
-main-branch source is available on PYTHONPATH, prefer importing from there
-instead of duplicating logic — the function signatures match.
-
-Source of truth: <main>:src/meld_dataset.py
-"""
 import io
 import math
 import random
@@ -117,10 +107,6 @@ def get_corruption_config(preset="medium", **overrides):
     return config
 
 
-# ============================================================
-# Text
-# ============================================================
-
 def corrupt_text(text, char_swap_prob=0.1, word_drop_prob=0.1):
     words = text.split()
     if len(words) > 1:
@@ -136,10 +122,6 @@ def corrupt_text(text, char_swap_prob=0.1, word_drop_prob=0.1):
         corrupted.append("".join(chars))
     return " ".join(corrupted)
 
-
-# ============================================================
-# Audio
-# ============================================================
 
 def corrupt_audio(waveform, noise_level=0.05):
     noise = np.random.randn(*waveform.shape).astype(waveform.dtype) * noise_level
@@ -211,10 +193,6 @@ def apply_audio_corruptions(waveform, sample_rate, config):
             raise ValueError(f"Unknown audio corruption: {corruption}")
     return corrupted.astype(np.float32)
 
-
-# ============================================================
-# Video
-# ============================================================
 
 def add_video_noise(frames, noise_level):
     noise = np.random.randn(*frames.shape).astype(np.float32) * noise_level * 255.0

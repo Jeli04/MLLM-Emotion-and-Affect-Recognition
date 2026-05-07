@@ -10,11 +10,6 @@
 #SBATCH --job-name=affectgpt_eval
 #SBATCH --output=slurm-eval-%j.out
 
-# ==============================================================
-# Run Missing Modality Evaluation on MELD (all 7 masking schemes)
-# Requires: 1x A100 GPU (40/80 GB), ~30 GB RAM
-# ==============================================================
-
 export PATH="/home1/palmerla/.conda/envs/affgpt/bin:$PATH"
 
 cd /home1/palmerla/eval_affectgpt/AffectGPT/AffectGPT

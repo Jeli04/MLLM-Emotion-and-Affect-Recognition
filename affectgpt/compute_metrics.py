@@ -1,19 +1,3 @@
-"""
-Compute MELD / CMU-MOSEI metrics from cached AffectGPT responses + logits.
-
-Reads JSONL files from cache_outputs.py. For each record, prefers using the
-emotion_logits dict (argmax over candidate logits) if present, else falls back
-to text-parsing the model's response.
-
-Outputs:
-    <input_basename>.metrics.json   — accuracy, weighted/macro F1, MCC,
-                                      AUROC/AUPRC (when logits present),
-                                      classification_report, per-class accuracy
-
-Usage:
-    python compute_metrics.py output/cache/<cond>-<preset>/meld.jsonl
-    python compute_metrics.py "output/cache/*/meld.jsonl"
-"""
 import argparse
 import glob
 import json
@@ -44,14 +28,12 @@ def parse_text_pred(response, candidates):
 
 
 def predict_from_record(rec, candidates):
-    """Return (predicted_label, probs_list_aligned_with_candidates_or_None)."""
     logits_dict = rec.get("emotion_logits")
     if logits_dict and all(c in logits_dict for c in candidates):
         logits = [logits_dict[c] for c in candidates]
         probs = softmax(logits)
         idx = max(range(len(candidates)), key=lambda i: logits[i])
         return candidates[idx], probs
-    # Fallback to text parse
     return parse_text_pred(rec.get("response", ""), candidates), None
 
 
@@ -69,10 +51,10 @@ def compute_meld(records):
 
     preds = []
     gts = []
-    all_probs = []   # parallel; None if no logits
+    all_probs = []
     invalid = []
     skipped = []
-    per_sample = []  # name, gt_idx, gt_label, pred_idx, pred_label, probs
+    per_sample = []
 
     for rec in records:
         if rec.get("error"):
@@ -101,10 +83,9 @@ def compute_meld(records):
             "ground_truth_label": gt,
             "predicted_idx": label2idx[pred] if pred in label2idx else None,
             "predicted_label": pred,
-            "probs": probs,  # aligned with MELD_EMOS order; None if no logits
+            "probs": probs,
         })
 
-    # Per-class accuracy
     per_class_correct = defaultdict(int)
     per_class_total = defaultdict(int)
     correct = 0
@@ -142,7 +123,6 @@ def compute_meld(records):
         output_dict=True,
     )
 
-    # AUROC/AUPRC only if every record has logits
     auroc = auprc = None
     if all_probs and all(p is not None for p in all_probs):
         try:
@@ -228,11 +208,9 @@ def detect_dataset_from_path(path):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("inputs", nargs="+",
-                    help="JSONL file(s) (or globs) from cache_outputs.py")
-    ap.add_argument("--out", default=None,
-                    help="Override output path (default: <input>.metrics.json).")
-    ap.add_argument("--dataset", default=None, help="MELD or CMUMOSEI")
+    ap.add_argument("inputs", nargs="+")
+    ap.add_argument("--out", default=None)
+    ap.add_argument("--dataset", default=None)
     args = ap.parse_args()
 
     files = []

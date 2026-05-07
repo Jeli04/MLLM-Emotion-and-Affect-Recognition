@@ -27,7 +27,7 @@ logging.getLogger().addFilter(
     lambda r: "System prompt modified" not in r.getMessage()
 )
 
-# Patch optimum to recognize Qwen2.5-Omni's layer structure
+# fix optimum and qwen compatibility issues
 import optimum.gptq.constants
 optimum.gptq.constants.BLOCK_PATTERNS.insert(0, "thinker.model.layers")
 
@@ -66,86 +66,57 @@ def set_adapter_trainability(model, adapter_name, trainable):
 
 
 def infer_dpo_corpus(dpo_data_path: str, explicit: str) -> str:
-    """Return 'meld' or 'iemocap'. Respect explicit when not 'auto'."""
     if explicit in ("meld", "iemocap"):
         return explicit
+        
     with open(dpo_data_path, "r", encoding="utf-8") as f:
         data = json.load(f)
+        
     if isinstance(data, dict) and str(data.get("dataset", "")).lower() == "iemocap":
         return "iemocap"
+        
     return "meld"
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(
-        description="DPO-tune Qwen2.5-Omni on MELD or IEMOCAP preference JSON from src.dpo.build_dpo_dataset",
-    )
-    parser.add_argument(
-        "--dataset",
-        default="auto",
-        choices=["auto", "meld", "iemocap"],
-        help="Corpus layout: auto reads 'dataset' from JSON (default); override if needed.",
-    )
-    parser.add_argument("--model_path", default="./ckpts/Qwen2.5-Omni-7B-GPTQ-Int4",
-                        help="Path to the pretrained model")
-    parser.add_argument("--dpo_data_path",
-                        default="results/dpo/dpo_samples_train_audio+text+video_corrupt_finetuned.json",
-                        help="Path to the JSON file produced by src.dpo.build_dpo_dataset")
-    parser.add_argument("--modalities", nargs="+", default=["text"],
-                        choices=["text", "audio", "video"],
-                        help="Which modalities to include in the input")
-    parser.add_argument("--output_dir", default="./ckpts/dpo_finetuned",
-                        help="Directory to save DPO-tuned LoRA adapter")
-    parser.add_argument("--adapter_path", "--initial_adapter_path", dest="adapter_path",
-                        default=None,
-                        help="Optional SFT/student-teacher LoRA adapter to continue "
-                             "training with DPO. When set, the adapter is loaded as "
-                             "the trainable policy adapter.")
-    parser.add_argument("--reference_adapter_path", default=None,
-                        help="Optional frozen LoRA adapter to use for DPO reference "
-                             "logprobs. Defaults to --adapter_path when provided. "
-                             "If omitted without --adapter_path, the base model is "
-                             "used as the reference.")
-    parser.add_argument("--base_reference", action="store_true", default=False,
-                        help="Use the base model with adapters disabled for reference "
-                             "logprobs, even when --adapter_path is provided.")
+    parser = argparse.ArgumentParser(description="tune dpo qwen on meld or iemocap preference json from src.dpo.build_dpo_dataset",)
+    parser.add_argument("--dataset",default="auto",choices=["auto", "meld", "iemocap"])
+    parser.add_argument("--model_path", default="./ckpts/Qwen2.5-Omni-7B-GPTQ-Int4")
+    parser.add_argument("--dpo_data_path",default="results/dpo/dpo_samples_train_audio+text+video_corrupt_finetuned.json")
+    parser.add_argument("--modalities", nargs="+", default=["text"],choices=["text", "audio", "video"])
+    parser.add_argument("--output_dir", default="./ckpts/dpo_finetuned")
+    
+    parser.add_argument("--adapter_path", "--initial_adapter_path", dest="adapter_path",default=None)
+    parser.add_argument("--reference_adapter_path", default=None)
+    parser.add_argument("--base_reference", action="store_true", default=False)
+    
     parser.add_argument("--num_epochs", type=int, default=1)
     parser.add_argument("--batch_size", type=int, default=1)
+    
     parser.add_argument("--gradient_accumulation_steps", type=int, default=8)
     parser.add_argument("--learning_rate", type=float, default=5e-6)
-    parser.add_argument("--beta", type=float, default=0.1,
-                        help="DPO inverse-temperature parameter")
-    parser.add_argument("--eval_ratio", type=float, default=0.1,
-                        help="Optional fraction of DPO data held out for eval")
+    parser.add_argument("--beta", type=float, default=0.1)
+    parser.add_argument("--eval_ratio", type=float, default=0.1)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--lora_r", type=int, default=16)
     parser.add_argument("--lora_alpha", type=int, default=32)
     parser.add_argument("--lora_dropout", type=float, default=0.05)
+    
     parser.add_argument("--logging_steps", type=int, default=10)
     parser.add_argument("--save_steps", type=int, default=200)
-    parser.add_argument("--reference_free", action="store_true",
-                        help="Use reference-free preference optimization and skip "
-                             "reference-model logprobs")
-    parser.add_argument("--corrupt", action="store_true", default=True,
-                        help="Apply input corruption (MELD: legacy noise; IEMOCAP: preset from each JSON row)")
+    parser.add_argument("--reference_free", action="store_true")
+    
+    parser.add_argument("--corrupt", action="store_true", default=True)
     parser.add_argument("--no_corrupt", dest="corrupt", action="store_false")
-    parser.add_argument("--corruption_preset", default=None,
-                        help="Corruption preset to use when --corrupt is enabled. "
-                             "Defaults to the preset stored in the DPO JSON, or 'medium'.")
-    parser.add_argument("--max_audio_seconds", type=float, default=20.0,
-                        help="Cap each DPO audio clip to this many seconds to avoid "
-                             "rare long-sample OOMs. Use <=0 to disable.")
-    parser.add_argument("--max_video_frames", type=int, default=16,
-                        help="Uniformly downsample each DPO video clip to at most this "
-                             "many frames. Use <=0 to disable.")
-    parser.add_argument("--torch_empty_cache_steps", type=int, default=1,
-                        help="Ask Trainer to release unused CUDA cache before backward "
-                             "every N optimizer steps. Use <=0 to disable.")
-    parser.add_argument("--resume_from_checkpoint", default=None,
-                        help="Resume Trainer state from a checkpoint path. Use 'auto' "
-                             "to resume from the latest checkpoint in output_dir.")
+    parser.add_argument("--corruption_preset", default=None)
+    
+    parser.add_argument("--max_audio_seconds", type=float, default=20.0)
+    parser.add_argument("--max_video_frames", type=int, default=16)
+    
+    parser.add_argument("--torch_empty_cache_steps", type=int, default=1)
+    parser.add_argument("--resume_from_checkpoint", default=None)
 
-    # W&B args
+    # wandb args
     parser.add_argument("--wandb", dest="wandb", action="store_true", default=True,
                         help="Enable Weights & Biases logging")
     parser.add_argument("--no_wandb", dest="wandb", action="store_false",
@@ -169,19 +140,13 @@ def parse_args():
             )
         if args.corruption_preset not in preset_names:
             parser.error(
-                f"--corruption_preset must be one of {preset_names}, "
+                f"invalid corruption preset name, "
                 f"got {args.corruption_preset!r}",
             )
     return args
 
 
 class DPODataset(Dataset):
-    """Preference dataset built from dpo_samples_*.json (MELD or IEMOCAP).
-
-    Each item returns two model-ready examples:
-      - chosen: prompt + ground-truth emotion
-      - rejected: prompt + confused model prediction
-    """
 
     def __init__(
         self,
@@ -257,7 +222,6 @@ class DPODataset(Dataset):
         if max_frames is None or len(frames) <= max_frames:
             return frames
 
-        # Qwen2.5-Omni expects an even frame count for temporal patching.
         max_frames = max(2, int(max_frames))
         if max_frames % 2:
             max_frames -= 1
@@ -336,7 +300,6 @@ class DPODataset(Dataset):
         )
 
     def _load_media_iemocap(self, sample):
-        """IEMOCAP: audio always from ``audio_path`` via librosa (no video demux)."""
         has_video = "video" in self.modalities
         has_audio = "audio" in self.modalities
         preset = sample.get("corruption_preset") or "medium"
@@ -441,7 +404,6 @@ class DPODataset(Dataset):
         }
 
     def build_classification_inputs(self, idx, candidate_emotions):
-        """Encode prompt + each candidate emotion for argmax-logp classification."""
         sample, prompt_messages, processor_kwargs, prompt_len = self._build_prompt(idx)
         candidates = [
             self._encode_response(prompt_messages, emotion, processor_kwargs, prompt_len)
@@ -451,11 +413,7 @@ class DPODataset(Dataset):
             "candidates": candidates,
             "ground_truth": sample["ground_truth"],
         }
-
-
-# Backward-compatible name for older references / scripts.
 MELDDPODataset = DPODataset
-
 
 class DPODataCollator:
     def __init__(self, collate_fn_impl, pad_token_id):
@@ -533,9 +491,6 @@ class PreferenceTrainer(Trainer):
     def _forward_logps(self, model, batch):
         labels = batch["labels"]
         model_inputs = {key: value for key, value in batch.items() if key != "labels"}
-        # Bypass Accelerate's ConvertOutputsToFp32 wrapper. DPO only needs
-        # response-token logprobs, so casting the full [B, T, V] logits tensor
-        # to fp32 can OOM before we get a chance to slice it down.
         inner_forward = getattr(model.forward, "model_forward", model.forward)
         outputs = inner_forward(**model_inputs)
         logits = outputs.logits if hasattr(outputs, "logits") else outputs[0]

@@ -22,7 +22,7 @@ from sklearn.metrics import (
 )
 from sklearn.preprocessing import label_binarize
 
-# Patch optimum to recognize Qwen2.5-Omni's layer structure
+# fix optimum and qwen compatibility issues
 import optimum.gptq.constants
 optimum.gptq.constants.BLOCK_PATTERNS.insert(0, "thinker.model.layers")
 
@@ -42,11 +42,7 @@ from src.iemocap_dataset import (
     SYSTEM_PROMPT as IEMOCAP_SYSTEM_PROMPT,
 )
 
-# Mapping pred -> plausible ground-truth labels. Used to keep DPO pairs where
-# the model's wrong prediction is in a known confusion direction. Edges include
-# both "natural" emotional confusions and observed over-prediction directions
-# (e.g. anger/surprise/joy frequently produced when the gold is neutral), so
-# DPO can correct the SFT's most common false positives.
+
 MELD_CONFUSION_PAIRS = {
     "neutral":  ["sadness", "joy", "anger", "surprise"],
     "sadness":  ["neutral", "fear", "anger"],
@@ -57,7 +53,7 @@ MELD_CONFUSION_PAIRS = {
     "fear":     ["surprise", "sadness", "neutral"],
 }
 
-# Plausible confusions for IEMOCAP 10-class labels (same semantics as MELD graph where applicable).
+
 IEMOCAP_CONFUSION_PAIRS = {
     "neutral":    ["sad", "happy", "frustrated", "angry", "excited"],
     "sad":        ["neutral", "fearful", "frustrated", "angry"],
@@ -74,95 +70,42 @@ IEMOCAP_CONFUSION_PAIRS = {
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Build a DPO preference dataset from MELD or IEMOCAP using confusion-pair heuristics",
+        description="build dpo preference data set from meld or iemocap",
     )
-    parser.add_argument(
-        "--dataset",
-        default="meld",
-        choices=["meld", "iemocap"],
-        help="Source corpus (default: meld)",
-    )
-    parser.add_argument("--modalities", nargs="+", default=["text"],
-                        choices=["text", "audio", "video"],
-                        help="Which modalities to include in the input (default: text)")
-    parser.add_argument(
-        "--split",
-        default="train",
-        help="MELD: train|dev|test. IEMOCAP: value for manifest 'split' column if present; "
-             "otherwise ignored (see RawIEMOCAPDataset warning).",
-    )
-    parser.add_argument("--data_root", default="/project2/robinjia_875/lijc/data/MELD.Raw",
-                        help="Path to MELD.Raw directory (MELD only)")
-    parser.add_argument(
-        "--manifest",
-        default=None,
-        help="Path to IEMOCAP utterance manifest CSV (required when --dataset iemocap)",
-    )
-    parser.add_argument(
-        "--iemocap_sessions",
-        nargs="+",
-        default=None,
-        help="Optional IEMOCAP session filter, e.g. Session1 Session2",
-    )
-    parser.add_argument(
-        "--iemocap_manifest_split",
-        default=None,
-        help="Override --split for IEMOCAP manifest filtering (same as CorruptedIEMOCAPDataset split=)",
-    )
-    parser.add_argument(
-        "--iemocap_eval_holdout_n",
-        type=int,
-        default=500,
-        help="IEMOCAP only: exclude this many random manifest indices from DPO mining (default 500). "
-             "Uses --iemocap_eval_holdout_seed; same draw as SFT holdout / typical 500-sample eval. "
-             "Set to 0 to use every row after session/split filters.",
-    )
-    parser.add_argument(
-        "--iemocap_eval_holdout_seed",
-        type=int,
-        default=42,
-        help="RNG seed for IEMOCAP eval holdout exclusion (default 42)",
-    )
-    parser.add_argument("--model_path", default="./ckpts/Qwen2.5-Omni-7B-GPTQ-Int4",
-                        help="Path to the model")
-    parser.add_argument("--adapter_path", default=None,
-                        help="Path to a LoRA adapter checkpoint to load on top of the base model")
-    parser.add_argument("--corrupt", dest="corrupt", action="store_true", default=True,
-                        help="Apply noise/corruption to inputs (default: True)")
-    parser.add_argument("--no_corrupt", dest="corrupt", action="store_false",
-                        help="Disable input corruption")
-    parser.add_argument("--corruption_preset", default="medium",
-                        help="Corruption preset to use when --corrupt is enabled")
-    parser.add_argument("--output_dir", default=os.path.join("results", "dpo"),
-                        help="Directory where evaluation and DPO files are saved")
-    parser.add_argument(
-        "--output_name_suffix",
-        default=None,
-        help="Optional suffix to append to output filenames, e.g. student_teacher",
-    )
-    parser.add_argument("--correct_sample_ratio", type=float, default=0.0,
-                        help="Target fraction of final DPO samples drawn from correct model predictions. "
-                             "Correct predictions are eligible only when the highest-scoring "
-                             "non-ground-truth emotion is a known confusion-pair partner. "
-                             "Use 0 to disable correct-prediction samples.")
-    parser.add_argument("--correct_sample_seed", type=int, default=42,
-                        help="Random seed for selecting correct-prediction DPO samples")
-    parser.add_argument("--max_chosen_per_class", type=int, default=None,
-                        help="Optional cap on the number of DPO pairs per `chosen` label. "
-                             "Applied after confusion-pair and correct-prediction selection. "
-                             "Use to prevent majority `chosen` (e.g. neutral, joy) from "
-                             "dominating the preference signal. None disables the cap.")
-    parser.add_argument("--max_chosen_per_class_seed", type=int, default=42,
-                        help="Random seed used when subsampling pairs to enforce "
-                             "--max_chosen_per_class")
-    parser.add_argument("--seed", type=int, default=42,
-                        help="Random seed for model evaluation and input corruption")
+    
+    parser.add_argument("--dataset",default="meld",choices=["meld", "iemocap"])
+    parser.add_argument("--modalities", nargs="+", default=["text"],choices=["text", "audio", "video"])
+    parser.add_argument("--split",default="train")
+                        
+    parser.add_argument("--data_root", default="/project2/robinjia_875/lijc/data/MELD.Raw",help="path for MELD.Raw. for meld only")
+    parser.add_argument("--manifest",default=None,help="path for iemocap utterance manifest. for iemocap only",)
+    parser.add_argument("--iemocap_sessions",nargs="+",default=None)
+    parser.add_argument("--iemocap_manifest_split",default=None,help="override iemocap's manifest split if present")
+    parser.add_argument("--iemocap_eval_holdout_n",type=int,default=500)
+    parser.add_argument("--iemocap_eval_holdout_seed",type=int,default=42)
+    parser.add_argument("--model_path", default="./ckpts/Qwen2.5-Omni-7B-GPTQ-Int4")
+                        
+    parser.add_argument("--adapter_path", default=None, help="path to lora adapter checkpoint")
+    parser.add_argument("--corrupt", dest="corrupt", action="store_true", default=True,)
+    parser.add_argument("--no_corrupt", dest="corrupt", action="store_false")
+    parser.add_argument("--corruption_preset", default="medium")
+    parser.add_argument("--output_dir", default=os.path.join("results", "dpo"))
+    parser.add_argument("--output_name_suffix",default=None,)
+    
+    parser.add_argument("--correct_sample_ratio", type=float, default=0.0)
+    parser.add_argument("--correct_sample_seed", type=int, default=42)
+    parser.add_argument("--max_chosen_per_class", type=int, default=None)
+    parser.add_argument("--max_chosen_per_class_seed", type=int, default=42)
+    parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
+    
     preset_names = (
         IEMOCAP_CORRUPTION_PRESET_NAMES
         if args.dataset == "iemocap"
         else MELD_CORRUPTION_PRESET_NAMES
     )
+
+    #debug
     if args.corruption_preset not in preset_names:
         raise SystemExit(
             f"--corruption_preset must be one of {preset_names}, got {args.corruption_preset!r}",
@@ -173,20 +116,23 @@ def parse_args():
 
 
 def build_prompt_messages(raw_sample, modalities, *, system_prompt: str, dataset: str):
-    """Build the prompt side of a preference example in chat-message format."""
     user_content = []
     has_video = "video" in modalities
 
     for mod in modalities:
         if mod == "text":
             user_content.append({"type": "text", "text": raw_sample["text"]})
+            
         elif mod == "video":
             user_content.append({"type": "video", "video": raw_sample["video_path"]})
+            
         elif mod == "audio":
             if dataset == "iemocap":
                 audio_ref = raw_sample.get("audio_path") or raw_sample.get("video_path") or ""
+                
             else:
                 audio_ref = raw_sample["video_path"]
+                
             user_content.append({"type": "audio", "audio": audio_ref})
 
     return [
@@ -195,23 +141,7 @@ def build_prompt_messages(raw_sample, modalities, *, system_prompt: str, dataset
     ]
 
 
-def build_dpo_sample(
-    sample_index,
-    raw_sample,
-    gt_emotion,
-    pred,
-    raw_output,
-    modalities,
-    corrupt,
-    corruption_preset,
-    *,
-    system_prompt: str,
-    dataset: str,
-    rejected_emotion=None,
-    selection_reason="confusion_pair_error",
-    emotion_score_info=None,
-):
-    """Create a preference record for DPO: ground truth is chosen, confused prediction is rejected."""
+def build_dpo_sample(sample_index,raw_sample,gt_emotion,pred,raw_output,modalities,corrupt,corruption_preset,*,system_prompt: str,dataset: str,rejected_emotion=None,selection_reason="confusion_pair_error",emotion_score_info=None,):
     prompt_messages = build_prompt_messages(
         raw_sample, modalities, system_prompt=system_prompt, dataset=dataset,
     )
@@ -268,20 +198,13 @@ def get_rejected_emotion_for_correct_sample(gt_emotion, rng, confusion_pairs):
     alts = confusion_pairs.get(gt_emotion)
     if not alts:
         raise KeyError(
-            f"No confusion_pairs entry for ground-truth emotion {gt_emotion!r}; "
+            f"no confusion_pairs entry for ground truth emotion {gt_emotion!r}; "
             "extend the confusion graph for this label.",
         )
     return rng.choice(alts)
 
 
 def cap_samples_per_chosen(samples, max_per_class, seed):
-    """Downsample DPO pairs so no `chosen` label exceeds ``max_per_class``.
-
-    Returns ``(kept, dropped_per_class)`` where ``dropped_per_class`` maps the
-    `chosen` label to the number of pairs dropped for that label. When
-    ``max_per_class`` is ``None`` or no class exceeds the cap, samples are
-    returned unchanged.
-    """
     if max_per_class is None or max_per_class <= 0:
         return list(samples), {}
 
@@ -321,13 +244,7 @@ def sample_correct_predictions(correct_candidates, confusion_sample_count, targe
 
 
 def score_candidate_emotions(model, tokenizer, inputs, candidate_emotions):
-    """Score every emotion as the assistant response for the current prompt.
 
-    The DPO builder uses generation for the argmax prediction, but correct
-    predictions need a runner-up label. This helper teacher-forces each valid
-    emotion after the exact processed prompt and records length-normalized
-    response logprobs, avoiding randomly invented rejected labels.
-    """
     prompt_ids = inputs["input_ids"]
     prompt_attention = inputs["attention_mask"]
     prompt_len = prompt_ids.shape[-1]
@@ -390,7 +307,6 @@ def add_runner_up_info(score_info, gt_emotion, confusion_pairs):
 
 
 def make_eval_collate(collate_fn_impl, pad_token_id):
-    """Collate wrapper that extracts non-tensor metadata before calling collate_fn."""
 
     def eval_collate(batch, pad_token_id_inner):
         emotions = [b["emotion"] for b in batch]
@@ -435,7 +351,7 @@ def main():
         enable_audio_output=False,
     )
     if args.adapter_path is not None:
-        print(f"Loading LoRA adapter from {args.adapter_path}...")
+        print(f"Loading lora adapter from {args.adapter_path}...")
         model.thinker = PeftModel.from_pretrained(model.thinker, args.adapter_path)
 
     model.eval()
@@ -479,20 +395,19 @@ def main():
                 drop_no_agreement=True,
             )
             if not remaining:
-                raise SystemExit(
-                    "IEMOCAP eval holdout leaves no rows for DPO mining; reduce "
-                    "--iemocap_eval_holdout_n or relax session/split filters.",
-                )
+                raise SystemExit("iemocap eval holdout leaves no rows for dpo reduce --iemocap_eval_holdout_n or relax session/split filters.",) 
+                
             dataset = Subset(iemocap_full_ds, remaining)
             iemocap_index_map = remaining
+            
             print(
-                f"IEMOCAP eval holdout: excluding {len(holdout_indices_for_json)} manifest indices "
+                f"iemocap eval holdout: excluding {len(holdout_indices_for_json)} manifest indices "
                 f"(seed={args.iemocap_eval_holdout_seed}); DPO mining on {len(remaining)}/"
                 f"{len(iemocap_full_ds)} rows.",
             )
         else:
             dataset = iemocap_full_ds
-            print("IEMOCAP eval holdout: disabled (--iemocap_eval_holdout_n 0); mining all filtered rows.")
+            print("iemocap eval holdout: disabled (--iemocap_eval_holdout_n 0); mining all filtered rows.")
         use_audio_in_video = "video" in args.modalities and "audio" in args.modalities
 
     eval_collate = make_eval_collate(collate_fn_impl, processor.tokenizer.pad_token_id)
@@ -511,9 +426,7 @@ def main():
     skipped_samples = []
     per_sample_results = []
 
-    # DPO samples are examples where the model prediction is a known confusing
-    # emotion for the ground-truth label. Correct predictions are considered
-    # only if their forced-choice runner-up emotion is a confusion-pair partner.
+
     dpo_sample_indices = []
     dpo_samples = []
     correct_dpo_candidates = []
@@ -668,7 +581,6 @@ def main():
     )
     dpo_sample_indices = [s["sample_index"] for s in dpo_samples]
 
-    # --- Report metrics ---
     print("\n" + "=" * 60)
     print("RESULTS")
     print("=" * 60)
@@ -724,7 +636,7 @@ def main():
         model_str = args.output_name_suffix.strip().replace(" ", "_")
     else:
         model_str = "finetuned" if args.adapter_path else "base"
-    # Keep MELD output filenames unchanged; prefix IEMOCAP runs for clarity.
+
     ds_prefix = f"{args.dataset}_" if args.dataset == "iemocap" else ""
     output_filename = f"results_{ds_prefix}{split_label}_{modalities_str}_{corrupt_str}_{model_str}.json"
     output_path = os.path.join(args.output_dir, output_filename)

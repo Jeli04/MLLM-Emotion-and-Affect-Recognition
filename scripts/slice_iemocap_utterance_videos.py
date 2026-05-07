@@ -1,16 +1,5 @@
-#!/usr/bin/env python3
-"""
-iemocap starts with session level video only. this script slices videos into utterance level clips using time stamps from iemocap utterance timings
-
-Outputs to iemocap_root/Session/sentences/avi per session
-
-Example:
-  python scripts/slice_iemocap_utterance_videos.py \\
-    --iemocap_root "/path/to/IEMOCAP_full_release"
-"""
-
+# slice iemocap full session videos into proper utterances 
 from __future__ import annotations
-
 import argparse
 import re
 import shutil
@@ -70,6 +59,7 @@ def find_ffmpeg() -> str:
     exe = shutil.which("ffmpeg")
     if not exe:
         sys.exit("ffmpeg not in path")
+      
     return exe
 
 
@@ -80,8 +70,11 @@ def session_dirs(root: Path, names: list[str] | None) -> list[Path]:
             d = root / n
             if not d.is_dir():
                 sys.exit(f"Not a directory: {d}")
+              
             out.append(d)
+          
         return sorted(out, key=lambda p: p.name)
+      
     return sorted([p for p in root.iterdir() if p.is_dir() and p.name.startswith("Session")])
 
 
@@ -99,10 +92,12 @@ def find_dialog_avi(session_dir: Path, recording_id: str) -> Path | None:
     for c in candidates:
         if c.is_file():
             return c
+          
     if avi_root.is_dir():
         for p in avi_root.rglob(f"{recording_id}.avi"):
             if p.is_file():
                 return p
+              
     return None
 
 
@@ -128,8 +123,9 @@ def run_ffmpeg(
     cmd += ["-ss", f"{start_sec:.6f}", "-i", str(src), "-t", f"{duration:.6f}"]
     if use_copy:
         cmd += ["-c", "copy", str(dst)]
+      
     else:
-        # re encode for player compatibility, keep audio incase audio qwen wants to use audio directly from video but shouldn't need to
+        # re encode for player compatibility, keep audio incase audio qwen wants to use audio directly from video but shouldn't need to for iemocap
         cmd += [
             "-c:v",
             "libx264",
@@ -146,20 +142,26 @@ def run_ffmpeg(
     if r.returncode != 0:
         print(f"  ffmpeg failed for {dst.name}: {r.stderr or r.stdout}", file=sys.stderr)
         return False
+      
     return True
 
 
 def iter_transcription_lines(trans_dir: Path) -> list[tuple[Path, str]]:
     if not trans_dir.is_dir():
         return []
+      
     rows: list[tuple[Path, str]] = []
     for p in sorted(trans_dir.glob("*.txt")):
         text = p.read_text(encoding="utf-8", errors="replace").splitlines()
+      
         for line in text:
             line = line.strip()
+          
             if not line:
                 continue
+              
             rows.append((p, line))
+          
     return rows
 
 
@@ -224,8 +226,10 @@ def main() -> None:
             if args.dry_run:
                 done += 1
                 continue
+              
             if ok:
                 done += 1
+              
             else:
                 failed += 1
 

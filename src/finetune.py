@@ -28,7 +28,7 @@ logging.getLogger().addFilter(
     lambda r: "System prompt modified" not in r.getMessage()
 )
 
-# Patch optimum to recognize Qwen2.5-Omni's layer structure
+# fix optimum and qwen compatibility issues
 import optimum.gptq.constants
 optimum.gptq.constants.BLOCK_PATTERNS.insert(0, "thinker.model.layers")
 
@@ -50,7 +50,7 @@ from src.iemocap_dataset import (
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Finetune Qwen2.5-Omni on MELD or IEMOCAP emotion recognition",
+        description="fine tune qwen on meld or iemocap",
     )
     parser.add_argument("--dataset", default="meld", choices=["meld", "iemocap"],
                         help="Training corpus (default: meld)")
@@ -58,102 +58,108 @@ def parse_args():
                         help="Path to the pretrained model")
     parser.add_argument("--data_root", default="/project2/robinjia_875/lijc/data/MELD.Raw",
                         help="Path to MELD.Raw directory (MELD only)")
+
+    
     parser.add_argument(
         "--manifest",
         default=None,
-        help="Path to IEMOCAP utterance manifest CSV (required when --dataset iemocap)",
+        help="iemocap utterance manifest path",
     )
+    
     parser.add_argument(
         "--iemocap_sessions",
         nargs="+",
-        default=None,
-        help="Optional IEMOCAP session filter, e.g. Session1 Session2 (IEMOCAP only)",
+        default=None
     )
     parser.add_argument(
         "--iemocap_manifest_split",
-        default=None,
-        help="If the manifest has a 'split' column, keep only rows matching this value (IEMOCAP only)",
+        default=None
     )
     parser.add_argument(
         "--iemocap_holdout_n",
         type=int,
-        default=500,
-        help="Random eval holdout size excluded from train/val; set 0 to disable (IEMOCAP only). "
-             "Uses --iemocap_holdout_seed; same ordering as RawIEMOCAPDataset.",
+        default=500
     )
     parser.add_argument(
         "--iemocap_holdout_seed",
         type=int,
-        default=42,
-        help="RNG seed for the IEMOCAP holdout subset (default 42 matches common 500-sample evals)",
+        default=42
     )
+
+    
+    
     parser.add_argument(
         "--iemocap_val_ratio",
         type=float,
-        default=0.1,
-        help="Fraction of non-holdout samples used for validation (IEMOCAP only); 0 disables val",
+        default=0.1
     )
     parser.add_argument(
         "--iemocap_split_seed",
         type=int,
-        default=43,
-        help="RNG seed for shuffling non-holdout rows before train/val split (IEMOCAP only)",
+        default=43
     )
+
+
+    
     parser.add_argument(
         "--iemocap_weighted_sampler",
         action="store_true",
-        help="IEMOCAP only: balance train batches with WeightedRandomSampler "
-             "(mild sqrt-style weights + cap vs majority class)",
+        help="weighted random sampling for iemocap only for iemocap specific label imbalances,
     )
     parser.add_argument(
         "--iemocap_sampler_power",
         type=float,
-        default=0.5,
-        help="IEMOCAP weighted sampling: exponent on (n_max/n_c); 0.5=sqrt (default), 1.0=stronger",
+        default=0.5
     )
     parser.add_argument(
         "--iemocap_sampler_max_ratio",
         type=float,
-        default=40.0,
-        help="IEMOCAP weighted sampling: max per-sample weight vs majority after power (default 40)",
+        default=40.0
     )
+
+    
     parser.add_argument("--modalities", nargs="+", default=["text"],
-                        choices=["text", "audio", "video"],
-                        help="Which modalities to include in the input")
-    parser.add_argument("--output_dir", default="./ckpts/finetuned",
-                        help="Directory to save finetuned model")
+                        choices=["text", "audio", "video"])
+
+    
+    parser.add_argument("--output_dir", default="./ckpts/finetuned")
+
+    
     parser.add_argument("--num_epochs", type=int, default=3)
     parser.add_argument("--batch_size", type=int, default=1)
+
+    
     parser.add_argument("--gradient_accumulation_steps", type=int, default=8)
     parser.add_argument("--learning_rate", type=float, default=1e-4)
-    parser.add_argument("--max_grad_norm", type=float, default=1.0,
-                        help="Gradient clipping threshold (HF default 1.0). Lower "
-                             "values (e.g. 0.5) help with fp16 instability.")
+    parser.add_argument("--max_grad_norm", type=float, default=1.0)
     parser.add_argument("--precision", choices=["fp16", "bf16"], default="bf16",
                         help="Mixed-precision dtype. bf16 has wider dynamic range "
                              "than fp16 and doesn't need a loss scaler; use fp16 "
                              "only if your GPU lacks bf16 support.")
+
+    
     parser.add_argument("--l1ora_r", type=int, default=16)
     parser.add_argument("--lora_alpha", type=int, default=32)
     parser.add_argument("--lora_dropout", type=float, default=0.05)
+
+    
     parser.add_argument("--logging_steps", type=int, default=10)
     parser.add_argument("--save_steps", type=int, default=200)
-    parser.add_argument("--resume_from_checkpoint", type=str, default=None,
-                        help="Path to a checkpoint dir to resume from. Pass "
-                             "'true', 'latest', or 'auto' to use the latest "
-                             "checkpoint in output_dir.")
-    parser.add_argument("--corrupt", action="store_true", default=True,
-                        help="Apply noise/corruption to raw inputs")
+
+    
+    parser.add_argument("--resume_from_checkpoint", type=str, default=None)
+
+    
+    parser.add_argument("--corrupt", action="store_true", default=True)
     parser.add_argument("--no_corrupt", dest="corrupt", action="store_false")
-    parser.add_argument("--corruption_preset", default="medium",
-                        help="Corruption preset when --corrupt is enabled (mild|medium|strong for both datasets)")
-    parser.add_argument("--predict_corruption", action="store_true",
-                        help="Train the assistant to output emotion plus corrupted input modalities")
-    parser.add_argument("--seed", type=int, default=42,
-                        help="Random seed for python, numpy, torch, and HF Trainer")
-    parser.add_argument("--class_weighted_loss", action="store_true", default=False,
-                        help="Scale per-sample CE loss by inverse train-frequency of the "
-                             "ground-truth emotion to combat MELD's neutral imbalance")
+    parser.add_argument("--corruption_preset", default="medium")
+    parser.add_argument("--predict_corruption", action="store_true")
+
+    
+    parser.add_argument("--seed", type=int, default=42)
+
+    
+    parser.add_argument("--class_weighted_loss", action="store_true", default=False, help="scale per sample ce loss by inverse train frequency of the ground truth emotion to melds neutral label imbalance")
 
     # W&B args
     parser.add_argument("--wandb", dest="wandb", action="store_true", default=True,
@@ -219,7 +225,6 @@ def resolve_resume_from_checkpoint(resume_from_checkpoint, output_dir):
 
 
 def _unwrap_logits(logits, labels):
-    """Extract the token logits tensor from model outputs passed by Trainer."""
     if isinstance(logits, torch.Tensor):
         return logits
     if hasattr(logits, "logits"):
@@ -241,34 +246,23 @@ def _unwrap_logits(logits, labels):
 
 
 class _TrainerWithWeightedSampler(Trainer):
-    """Optional WeightedRandomSampler for IEMOCAP train (single-process DataLoader)."""
 
     def __init__(self, *args, train_weighted_sampler=None, **kwargs):
         self._train_weighted_sampler = train_weighted_sampler
         super().__init__(*args, **kwargs)
 
     def _get_train_sampler(self, *args, **kwargs):
-        # Newer `transformers.Trainer` passes the train dataset into `_get_train_sampler`;
-        # older versions call with no extra args.
         if self._train_weighted_sampler is not None:
             return self._train_weighted_sampler
         return super()._get_train_sampler(*args, **kwargs)
 
 
 def preprocess_logits_for_metrics(logits, labels):
-    # Reduce [batch, seq_len, vocab_size] → [batch, seq_len] before Trainer
-    # stores them, otherwise the full logit tensor OOMs on large sequences.
     logits = _unwrap_logits(logits, labels)
     return logits.argmax(dim=-1)
 
 
 class WeightedLossTrainer(_TrainerWithWeightedSampler):
-    """Trainer that scales each sample's mean CE loss by a per-class weight.
-
-    The class is identified from the first non-(-100) token in `labels`, which
-    in this dataset is always the emotion's first subword token.
-    """
-
     def __init__(self, *args, token_id_to_weight=None, **kwargs):
         super().__init__(*args, **kwargs)
         self.token_id_to_weight = dict(token_id_to_weight or {})
@@ -306,7 +300,6 @@ class WeightedLossTrainer(_TrainerWithWeightedSampler):
 
 
 def compute_inverse_freq_weights(emotion_counts, emotion_vocab):
-    """Return {emotion: weight} with w_c = N / (K * n_c), the sklearn 'balanced' rule."""
     emotions = list(emotion_vocab)
     counts = np.array([emotion_counts[e] for e in emotions], dtype=np.float64)
     if (counts <= 0).any():
@@ -318,20 +311,11 @@ def compute_inverse_freq_weights(emotion_counts, emotion_vocab):
 
 
 def make_compute_metrics(emotion_first_token_ids):
-    """Return a compute_metrics closure over the per-emotion first-token IDs.
-
-    emotion_first_token_ids: dict mapping emotion name → token ID of its first
-    subword (e.g. {"neutral": 19282, ...}), built from the processor tokenizer.
-
-    Reports overall accuracy, macro/weighted F1, and per-class accuracy + F1.
-    """
     id2emotion = {v: k for k, v in emotion_first_token_ids.items()}
     label_names = sorted(emotion_first_token_ids.keys())
 
     def compute_metrics(eval_pred):
         pred_tokens, label_ids = eval_pred
-        # pred_tokens: [n, seq_len] — argmax over vocab at each position
-        # label_ids:   [n, seq_len] — -100 for prompt/padding, real token elsewhere
 
         y_true = []
         y_pred = []
@@ -341,15 +325,14 @@ def make_compute_metrics(emotion_first_token_ids):
                 continue
             first_pos = int(resp[0])
             true_tok = int(label_seq[first_pos])
-            # logits[j] predicts the token at position j+1, so the prediction
-            # for the first response token lives at position first_pos - 1.
+
             pred_tok = int(pred_seq[first_pos - 1])
 
             true_emotion = id2emotion.get(true_tok)
             if true_emotion is None:
                 continue
             y_true.append(true_emotion)
-            # Map non-emotion predictions to a unique sentinel so they count as wrong
+
             y_pred.append(id2emotion.get(pred_tok, f"__other_{pred_tok}"))
 
         if not y_true:
@@ -401,7 +384,7 @@ def main():
             f"max_ratio={args.iemocap_sampler_max_ratio}"
         )
 
-    # Set W&B env vars before Trainer is created
+    # set wandb env vars before trainer is created
     if args.wandb:
         os.environ["WANDB_PROJECT"] = args.wandb_project
         if args.wandb_entity is not None:
@@ -410,7 +393,8 @@ def main():
     processor = Qwen2_5OmniProcessor.from_pretrained(args.model_path)
 
     emotion_vocab = IEMOCAP_EMOTION2ID if args.dataset == "iemocap" else MELD_EMOTION2ID
-    # Build emotion -> first-subword-token-ID map for compute_metrics.
+    
+    # build emotion first subword token id map for compute metrics
     emotion_first_token_ids = {
         emotion: processor.tokenizer(
             emotion, add_special_tokens=False
@@ -435,7 +419,7 @@ def main():
 
     thinker = get_peft_model(model.thinker, lora_config)
 
-    # remove unused speech-generation side
+    # remove unused speech generation side
     if hasattr(model, "talker"):
         del model.talker
     if hasattr(model, "token2wav"):

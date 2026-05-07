@@ -1,18 +1,12 @@
 #!/usr/bin/env python3
 """
-Slice IEMOCAP dialog-level AVIs into per-utterance video clips using timestamps from
-SessionX/dialog/transcriptions/*.txt (same timing as utterance-level WAV under sentences/wav).
+iemocap starts with session level video only. this script slices videos into utterance level clips using time stamps from iemocap utterance timings
 
-Output layout (mirrors sentences/wav):
-  <iemocap_root>/SessionK/sentences/avi/<recording_id>/<utterance_id>.mp4
-
-Requires ffmpeg in PATH.
+Outputs to iemocap_root/Session/sentences/avi per session
 
 Example:
   python scripts/slice_iemocap_utterance_videos.py \\
     --iemocap_root "/path/to/IEMOCAP_full_release"
-
-If ``--iemocap_root`` is omitted, uses ``<repo>/IEMOCAP_full_release``.
 """
 
 from __future__ import annotations
@@ -25,12 +19,11 @@ import sys
 from pathlib import Path
 
 
-# Ses01F_impro01_F000 [006.2901-008.2357]: Excuse me.
+# regex for finding iemocap style time stamps
+# example: Ses01F_impro01_F000 [006.2901-008.2357]: Excuse me.
 TRANSCRIPTION_LINE_RE = re.compile(
     r"^(?P<utt_id>\S+)\s+\[(?P<start>\d+(?:\.\d+)?)-(?P<end>\d+(?:\.\d+)?)\]\s*:\s*(?P<text>.*)$"
 )
-
-# Utterance id ends with _F### or _M### (three digits); recording id is the prefix.
 UTT_TO_RECORDING_RE = re.compile(r"^(?P<rec>.+)_[FM]\d{3}$")
 
 
@@ -40,45 +33,35 @@ def _default_iemocap_root() -> Path:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Create per-utterance video clips for IEMOCAP (dialog AVI + transcription times).",
+        description="create per utterance video clips for iemocap",
     )
     p.add_argument(
         "--iemocap_root",
         type=Path,
         default=None,
-        help=f"Path to IEMOCAP_full_release (default: {_default_iemocap_root()})",
+        help=f"path to iemocap data (iemocap full release)",
     )
     p.add_argument(
         "--sessions",
         nargs="*",
         default=None,
-        help="Optional session folder names, e.g. Session1 Session2. Default: all Session* under root.",
+        help="set session folder names optional",
     )
     p.add_argument(
         "--output_subdir",
         default="avi",
-        help="Under sentences/, clips go to sentences/<output_subdir>/ (default: avi).",
+        help="output sub directory, optional. default sub directory /avi/",
     )
     p.add_argument(
         "--overwrite",
         action="store_true",
-        help="Re-encode clips even if the output file already exists.",
-    )
-    p.add_argument(
-        "--copy",
-        action="store_true",
-        help="Use stream copy (-c copy) instead of re-encoding to H.264/AAC. Faster but cuts may be less accurate.",
-    )
-    p.add_argument(
-        "--dry_run",
-        action="store_true",
-        help="Print planned ffmpeg commands without running them.",
+        help="overwrites clips if you run this while they already exist",
     )
     p.add_argument(
         "--limit",
         type=int,
         default=None,
-        help="Process at most this many utterances (for smoke tests).",
+        help="limit the amount of utterances to process for smoke test",
     )
     return p.parse_args()
 
@@ -86,7 +69,7 @@ def parse_args() -> argparse.Namespace:
 def find_ffmpeg() -> str:
     exe = shutil.which("ffmpeg")
     if not exe:
-        sys.exit("ffmpeg not found in PATH. Install ffmpeg and retry.")
+        sys.exit("ffmpeg not in path")
     return exe
 
 
@@ -108,9 +91,6 @@ def recording_id_from_utterance(utt_id: str) -> str | None:
 
 
 def find_dialog_avi(session_dir: Path, recording_id: str) -> Path | None:
-    """
-    Official layout uses SessionX/dialog/avi/<name>.avi; some releases nest under dialog/avi/DivX/.
-    """
     avi_root = session_dir / "dialog" / "avi"
     candidates = [
         avi_root / f"{recording_id}.avi",
@@ -144,12 +124,12 @@ def run_ffmpeg(
     dst.parent.mkdir(parents=True, exist_ok=True)
 
     cmd: list[str] = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y"]
-    # Accurate seek: place -ss after -i for frame-accurate cuts (slower) — for dataset prep we prefer accuracy.
+    
     cmd += ["-ss", f"{start_sec:.6f}", "-i", str(src), "-t", f"{duration:.6f}"]
     if use_copy:
         cmd += ["-c", "copy", str(dst)]
     else:
-        # Re-encode for broad player/model compatibility; keep audio (Qwen may use audio from video).
+        # re encode for player compatibility, keep audio incase audio qwen wants to use audio directly from video but shouldn't need to
         cmd += [
             "-c:v",
             "libx264",
@@ -161,10 +141,6 @@ def run_ffmpeg(
             "+faststart",
             str(dst),
         ]
-
-    if dry_run:
-        print(" ".join(cmd))
-        return True
 
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0:
@@ -253,10 +229,6 @@ def main() -> None:
             else:
                 failed += 1
 
-    print(
-        f"Finished. encoded={done} skipped_existing={skipped_exists} "
-        f"missing_source_avi={missing_video} parse_skips={parse_fail} failed={failed}"
-    )
 
 
 if __name__ == "__main__":

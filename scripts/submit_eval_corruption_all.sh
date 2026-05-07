@@ -94,11 +94,11 @@ submit_combo() {
 #     submit_combo "base" "$BASE_SBATCH" "$combo"
 # done
 
-for combo in "${FINETUNED_COMBOS[@]}"; do
-    submit_combo "finetuned" "$FINETUNED_SBATCH" "$combo"
-done
-
-# dpo_run_label="dpo_$(run_label_from_extra_args "finetune")"
-# for combo in "${DPO_COMBOS[@]}"; do
-#     submit_combo "dpo" "$FINETUNED_SBATCH" "$combo" --run_label "$dpo_run_label"
+# for combo in "${FINETUNED_COMBOS[@]}"; do
+#     submit_combo "finetuned" "$FINETUNED_SBATCH" "$combo"
 # done
+
+dpo_run_label="dpo_$(run_label_from_extra_args "finetune")"
+for combo in "${DPO_COMBOS[@]}"; do
+    submit_combo "dpo" "$FINETUNED_SBATCH" "$combo" --run_label "$dpo_run_label"
+done

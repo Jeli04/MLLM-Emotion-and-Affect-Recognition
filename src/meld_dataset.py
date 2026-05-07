@@ -84,8 +84,8 @@ CORRUPTION_PRESETS = {
         "video_jpeg_quality": 55,
     },
     "medium": {
-        "text_char_swap_prob": 0.04,
-        "text_word_drop_prob": 0.03,
+        "text_char_swap_prob": 0.1,
+        "text_word_drop_prob": 0.1,
         "audio_noise_level": 0.05,
         "audio_corruptions": ["snr_noise", "noise", "dropout", "lowpass"],
         "audio_snr_db": 12.0,
@@ -111,8 +111,8 @@ CORRUPTION_PRESETS = {
         "video_jpeg_quality": 35,
     },
     "strong": {
-        "text_char_swap_prob": 0.06,
-        "text_word_drop_prob": 0.05,
+        "text_char_swap_prob": 0.2,
+        "text_word_drop_prob": 0.2,
         "audio_noise_level": 0.12,
         "audio_corruptions": ["snr_noise", "noise", "dropout", "clip", "lowpass"],
         "audio_snr_db": 5.0,

@@ -1,5 +1,6 @@
 import argparse
 import faulthandler
+import json
 import logging
 import os
 from collections import Counter
@@ -9,6 +10,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from sklearn.metrics import accuracy_score, f1_score
+from torch.utils.data import Subset, WeightedRandomSampler
 from transformers import (
     Qwen2_5OmniForConditionalGeneration,
     Qwen2_5OmniProcessor,
@@ -31,19 +33,90 @@ import optimum.gptq.constants
 optimum.gptq.constants.BLOCK_PATTERNS.insert(0, "thinker.model.layers")
 
 from src.meld_dataset import (
-    CORRUPTION_PRESET_NAMES,
+    CORRUPTION_PRESET_NAMES as MELD_CORRUPTION_PRESET_NAMES,
     CorruptedMELDDataset,
-    collate_fn,
-    EMOTION2ID,
+    collate_fn as meld_collate_fn,
+    EMOTION2ID as MELD_EMOTION2ID,
+)
+from src.iemocap_dataset import (
+    CORRUPTION_PRESET_NAMES as IEMOCAP_CORRUPTION_PRESET_NAMES,
+    CorruptedIEMOCAPDataset,
+    EMOTION2ID as IEMOCAP_EMOTION2ID,
+    collate_fn as iemocap_collate_fn,
+    compute_iemocap_train_val_holdout_split,
+    iemocap_train_subset_sample_weights,
 )
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Finetune Qwen2.5-Omni on MELD emotion recognition")
+    parser = argparse.ArgumentParser(
+        description="Finetune Qwen2.5-Omni on MELD or IEMOCAP emotion recognition",
+    )
+    parser.add_argument("--dataset", default="meld", choices=["meld", "iemocap"],
+                        help="Training corpus (default: meld)")
     parser.add_argument("--model_path", default="./ckpts/Qwen2.5-Omni-7B-GPTQ-Int4",
                         help="Path to the pretrained model")
     parser.add_argument("--data_root", default="/project2/robinjia_875/lijc/data/MELD.Raw",
-                        help="Path to MELD.Raw directory")
+                        help="Path to MELD.Raw directory (MELD only)")
+    parser.add_argument(
+        "--manifest",
+        default=None,
+        help="Path to IEMOCAP utterance manifest CSV (required when --dataset iemocap)",
+    )
+    parser.add_argument(
+        "--iemocap_sessions",
+        nargs="+",
+        default=None,
+        help="Optional IEMOCAP session filter, e.g. Session1 Session2 (IEMOCAP only)",
+    )
+    parser.add_argument(
+        "--iemocap_manifest_split",
+        default=None,
+        help="If the manifest has a 'split' column, keep only rows matching this value (IEMOCAP only)",
+    )
+    parser.add_argument(
+        "--iemocap_holdout_n",
+        type=int,
+        default=500,
+        help="Random eval holdout size excluded from train/val; set 0 to disable (IEMOCAP only). "
+             "Uses --iemocap_holdout_seed; same ordering as RawIEMOCAPDataset.",
+    )
+    parser.add_argument(
+        "--iemocap_holdout_seed",
+        type=int,
+        default=42,
+        help="RNG seed for the IEMOCAP holdout subset (default 42 matches common 500-sample evals)",
+    )
+    parser.add_argument(
+        "--iemocap_val_ratio",
+        type=float,
+        default=0.1,
+        help="Fraction of non-holdout samples used for validation (IEMOCAP only); 0 disables val",
+    )
+    parser.add_argument(
+        "--iemocap_split_seed",
+        type=int,
+        default=43,
+        help="RNG seed for shuffling non-holdout rows before train/val split (IEMOCAP only)",
+    )
+    parser.add_argument(
+        "--iemocap_weighted_sampler",
+        action="store_true",
+        help="IEMOCAP only: balance train batches with WeightedRandomSampler "
+             "(mild sqrt-style weights + cap vs majority class)",
+    )
+    parser.add_argument(
+        "--iemocap_sampler_power",
+        type=float,
+        default=0.5,
+        help="IEMOCAP weighted sampling: exponent on (n_max/n_c); 0.5=sqrt (default), 1.0=stronger",
+    )
+    parser.add_argument(
+        "--iemocap_sampler_max_ratio",
+        type=float,
+        default=40.0,
+        help="IEMOCAP weighted sampling: max per-sample weight vs majority after power (default 40)",
+    )
     parser.add_argument("--modalities", nargs="+", default=["text"],
                         choices=["text", "audio", "video"],
                         help="Which modalities to include in the input")
@@ -60,7 +133,7 @@ def parse_args():
                         help="Mixed-precision dtype. bf16 has wider dynamic range "
                              "than fp16 and doesn't need a loss scaler; use fp16 "
                              "only if your GPU lacks bf16 support.")
-    parser.add_argument("--lora_r", type=int, default=16)
+    parser.add_argument("--l1ora_r", type=int, default=16)
     parser.add_argument("--lora_alpha", type=int, default=32)
     parser.add_argument("--lora_dropout", type=float, default=0.05)
     parser.add_argument("--logging_steps", type=int, default=10)
@@ -73,8 +146,7 @@ def parse_args():
                         help="Apply noise/corruption to raw inputs")
     parser.add_argument("--no_corrupt", dest="corrupt", action="store_false")
     parser.add_argument("--corruption_preset", default="medium",
-                        choices=CORRUPTION_PRESET_NAMES,
-                        help="Corruption preset to use when --corrupt is enabled")
+                        help="Corruption preset when --corrupt is enabled (mild|medium|strong for both datasets)")
     parser.add_argument("--predict_corruption", action="store_true",
                         help="Train the assistant to output emotion plus corrupted input modalities")
     parser.add_argument("--seed", type=int, default=42,
@@ -95,7 +167,28 @@ def parse_args():
     parser.add_argument("--wandb_run_name", type=str, default=None,
                         help="Optional W&B run name")
 
-    return parser.parse_args()
+    args = parser.parse_args()
+    preset_names = (
+        IEMOCAP_CORRUPTION_PRESET_NAMES
+        if args.dataset == "iemocap"
+        else MELD_CORRUPTION_PRESET_NAMES
+    )
+    if args.corruption_preset not in preset_names:
+        parser.error(
+            f"--corruption_preset must be one of {preset_names}, got {args.corruption_preset!r}",
+        )
+    if args.dataset == "iemocap":
+        if not args.manifest:
+            parser.error("--manifest is required when --dataset iemocap")
+        if not 0.0 <= args.iemocap_val_ratio < 1.0:
+            parser.error("--iemocap_val_ratio must be in [0, 1)")
+    if args.iemocap_weighted_sampler and args.dataset != "iemocap":
+        parser.error("--iemocap_weighted_sampler requires --dataset iemocap")
+    if args.iemocap_sampler_power < 0:
+        parser.error("--iemocap_sampler_power must be >= 0")
+    if args.iemocap_sampler_max_ratio <= 0:
+        parser.error("--iemocap_sampler_max_ratio must be > 0")
+    return args
 
 
 def resolve_resume_from_checkpoint(resume_from_checkpoint, output_dir):
@@ -147,6 +240,21 @@ def _unwrap_logits(logits, labels):
     raise TypeError(f"Could not find logits tensor in output type {type(logits)}")
 
 
+class _TrainerWithWeightedSampler(Trainer):
+    """Optional WeightedRandomSampler for IEMOCAP train (single-process DataLoader)."""
+
+    def __init__(self, *args, train_weighted_sampler=None, **kwargs):
+        self._train_weighted_sampler = train_weighted_sampler
+        super().__init__(*args, **kwargs)
+
+    def _get_train_sampler(self, *args, **kwargs):
+        # Newer `transformers.Trainer` passes the train dataset into `_get_train_sampler`;
+        # older versions call with no extra args.
+        if self._train_weighted_sampler is not None:
+            return self._train_weighted_sampler
+        return super()._get_train_sampler(*args, **kwargs)
+
+
 def preprocess_logits_for_metrics(logits, labels):
     # Reduce [batch, seq_len, vocab_size] → [batch, seq_len] before Trainer
     # stores them, otherwise the full logit tensor OOMs on large sequences.
@@ -154,7 +262,7 @@ def preprocess_logits_for_metrics(logits, labels):
     return logits.argmax(dim=-1)
 
 
-class WeightedLossTrainer(Trainer):
+class WeightedLossTrainer(_TrainerWithWeightedSampler):
     """Trainer that scales each sample's mean CE loss by a per-class weight.
 
     The class is identified from the first non-(-100) token in `labels`, which
@@ -197,15 +305,16 @@ class WeightedLossTrainer(Trainer):
         return (loss, outputs) if return_outputs else loss
 
 
-def compute_inverse_freq_weights(emotion_counts):
+def compute_inverse_freq_weights(emotion_counts, emotion_vocab):
     """Return {emotion: weight} with w_c = N / (K * n_c), the sklearn 'balanced' rule."""
-    counts = np.array([emotion_counts[e] for e in EMOTION2ID], dtype=np.float64)
+    emotions = list(emotion_vocab)
+    counts = np.array([emotion_counts[e] for e in emotions], dtype=np.float64)
     if (counts <= 0).any():
-        raise ValueError(f"Found a class with 0 samples: {dict(zip(EMOTION2ID, counts))}")
+        raise ValueError(f"Found a class with 0 samples: {dict(zip(emotions, counts))}")
     N = counts.sum()
     K = len(counts)
     weights = N / (K * counts)
-    return {emotion: float(weights[i]) for i, emotion in enumerate(EMOTION2ID)}
+    return {emotion: float(weights[i]) for i, emotion in enumerate(emotions)}
 
 
 def make_compute_metrics(emotion_first_token_ids):
@@ -281,11 +390,16 @@ def main():
     args = parse_args()
     set_seed(args.seed)
     print(
-        f"Finetuning with modalities={args.modalities}, corrupt={args.corrupt}, "
+        f"Finetuning dataset={args.dataset} with modalities={args.modalities}, corrupt={args.corrupt}, "
         f"corruption_preset={args.corruption_preset}, "
         f"predict_corruption={args.predict_corruption}, wandb={args.wandb}, "
         f"seed={args.seed}"
     )
+    if args.iemocap_weighted_sampler:
+        print(
+            f"IEMOCAP weighted sampler: power={args.iemocap_sampler_power}, "
+            f"max_ratio={args.iemocap_sampler_max_ratio}"
+        )
 
     # Set W&B env vars before Trainer is created
     if args.wandb:
@@ -295,14 +409,16 @@ def main():
 
     processor = Qwen2_5OmniProcessor.from_pretrained(args.model_path)
 
+    emotion_vocab = IEMOCAP_EMOTION2ID if args.dataset == "iemocap" else MELD_EMOTION2ID
     # Build emotion -> first-subword-token-ID map for compute_metrics.
     emotion_first_token_ids = {
         emotion: processor.tokenizer(
             emotion, add_special_tokens=False
         )["input_ids"][0]
-        for emotion in EMOTION2ID
+        for emotion in emotion_vocab
     }
     print("Emotion first token IDs:", emotion_first_token_ids)
+    dtype = torch.float16 if args.precision == "fp16" else torch.bfloat16
     model = Qwen2_5OmniForConditionalGeneration.from_pretrained(
         args.model_path,
         device_map="auto",
@@ -340,8 +456,83 @@ def main():
         predict_corruption=args.predict_corruption,
         for_training=True,
     )
-    train_dataset = CorruptedMELDDataset(args.data_root, split="train", **common)
-    val_dataset = CorruptedMELDDataset(args.data_root, split="dev", **common)
+    train_weighted_sampler = None
+    if args.dataset == "meld":
+        train_dataset = CorruptedMELDDataset(args.data_root, split="train", **common)
+        val_dataset = CorruptedMELDDataset(args.data_root, split="dev", **common)
+        collate_fn = meld_collate_fn
+    else:
+        train_idx, val_idx, holdout_idx = compute_iemocap_train_val_holdout_split(
+            args.manifest,
+            holdout_n=args.iemocap_holdout_n,
+            holdout_seed=args.iemocap_holdout_seed,
+            val_ratio=args.iemocap_val_ratio,
+            split_seed=args.iemocap_split_seed,
+            sessions=args.iemocap_sessions,
+            split=args.iemocap_manifest_split,
+            drop_no_agreement=True,
+        )
+        os.makedirs(args.output_dir, exist_ok=True)
+        split_record = {
+            "manifest": os.path.abspath(args.manifest),
+            "train_indices": train_idx,
+            "val_indices": val_idx,
+            "holdout_indices": holdout_idx,
+            "holdout_n": args.iemocap_holdout_n,
+            "holdout_seed": args.iemocap_holdout_seed,
+            "val_ratio": args.iemocap_val_ratio,
+            "split_seed": args.iemocap_split_seed,
+            "sessions": args.iemocap_sessions,
+            "manifest_split_filter": args.iemocap_manifest_split,
+        }
+        split_path = os.path.join(args.output_dir, "iemocap_train_val_holdout_indices.json")
+        with open(split_path, "w", encoding="utf-8") as f:
+            json.dump(split_record, f, indent=2)
+        print(
+            f"IEMOCAP split: train={len(train_idx)} val={len(val_idx)} "
+            f"holdout={len(holdout_idx)} (saved {split_path})"
+        )
+
+        full_iemocap = CorruptedIEMOCAPDataset(
+            args.manifest,
+            split=args.iemocap_manifest_split,
+            sessions=args.iemocap_sessions,
+            max_samples=None,
+            **common,
+        )
+        train_dataset = Subset(full_iemocap, train_idx)
+        val_dataset = (
+            Subset(full_iemocap, val_idx) if val_idx else None
+        )
+        collate_fn = iemocap_collate_fn
+
+        if args.iemocap_weighted_sampler:
+            raw_df = full_iemocap.raw_dataset.df
+            sample_w = iemocap_train_subset_sample_weights(
+                train_idx,
+                raw_df,
+                power=args.iemocap_sampler_power,
+                max_ratio_to_majority=args.iemocap_sampler_max_ratio,
+            )
+            gen = torch.Generator()
+            gen.manual_seed(args.seed)
+            train_weighted_sampler = WeightedRandomSampler(
+                weights=sample_w,
+                num_samples=len(train_dataset),
+                replacement=True,
+                generator=gen,
+            )
+            ctr = Counter()
+            for ti in train_idx:
+                emo = str(raw_df.iloc[int(ti)]["emotion"]).strip().lower()
+                if emo in IEMOCAP_EMOTION2ID:
+                    ctr[emo] += 1
+            print(
+                "IEMOCAP weighted sampling: train class counts "
+                f"{dict(sorted(ctr.items(), key=lambda x: (-x[1], x[0])))}; "
+                f"per-sample weight min={sample_w.min().item():.6g} "
+                f"max={sample_w.max().item():.6g}"
+            )
 
     data_collator = partial(
         collate_fn,
@@ -351,7 +542,8 @@ def main():
 
     run_name = args.wandb_run_name or os.path.basename(os.path.abspath(args.output_dir))
 
-    training_args = TrainingArguments(
+    eval_strategy = "steps" if val_dataset is not None else "no"
+    training_args_kw = dict(
         output_dir=args.output_dir,
         num_train_epochs=args.num_epochs,
         per_device_train_batch_size=args.batch_size,
@@ -363,8 +555,7 @@ def main():
         logging_steps=args.logging_steps,
         save_steps=args.save_steps,
         save_total_limit=3,
-        eval_strategy="steps",
-        eval_steps=args.save_steps,
+        eval_strategy=eval_strategy,
         fp16=(args.precision == "fp16"),
         bf16=(args.precision == "bf16"),
         max_grad_norm=args.max_grad_norm,
@@ -375,20 +566,31 @@ def main():
         seed=args.seed,
         data_seed=args.seed,
     )
+    if eval_strategy == "steps":
+        training_args_kw["eval_steps"] = args.save_steps
 
-    trainer_cls = Trainer
+    training_args = TrainingArguments(**training_args_kw)
+
+    trainer_cls = _TrainerWithWeightedSampler
     extra_trainer_kwargs = {}
     if args.class_weighted_loss:
-        emotion_counts = Counter(train_dataset.raw_dataset.df["Emotion"].str.lower())
-        missing = set(EMOTION2ID) - set(emotion_counts)
+        if args.dataset == "meld":
+            emotion_counts = Counter(train_dataset.raw_dataset.df["Emotion"].str.lower())
+        else:
+            raw_df = full_iemocap.raw_dataset.df
+            emotion_counts = Counter(
+                str(raw_df.iloc[int(i)]["emotion"]).strip().lower()
+                for i in train_idx
+            )
+        missing = set(emotion_vocab) - set(emotion_counts)
         if missing:
             raise ValueError(f"Train split is missing emotions: {missing}")
-        class_weights = compute_inverse_freq_weights(emotion_counts)
+        class_weights = compute_inverse_freq_weights(emotion_counts, emotion_vocab)
         token_id_to_weight = {
             emotion_first_token_ids[e]: w for e, w in class_weights.items()
         }
         print("Class-weighted loss enabled. Per-emotion weights:")
-        for emotion in EMOTION2ID:
+        for emotion in emotion_vocab:
             print(f"  {emotion:9s}  count={emotion_counts[emotion]:5d}  "
                   f"weight={class_weights[emotion]:.4f}")
         trainer_cls = WeightedLossTrainer
@@ -402,6 +604,7 @@ def main():
         data_collator=data_collator,
         compute_metrics=make_compute_metrics(emotion_first_token_ids),
         preprocess_logits_for_metrics=preprocess_logits_for_metrics,
+        train_weighted_sampler=train_weighted_sampler,
         **extra_trainer_kwargs,
     )
 

@@ -26,17 +26,25 @@ source ./.venv/bin/activate
 
 # Precompute clean base-teacher logits for all three modalities.
 # Override --corrupt / --corruption_preset / --output_dir / etc. via "$@".
-PYTHONPATH=. python scripts/precompute_teacher_logits.py \
-    --modalities text audio video \
-    --splits train dev \
-    --base_teacher \
-    --no_corrupt \
-    --corruption_preset medium \
-    --output_dir ./cache/teacher_medium_logits/base_t+a+v \
-    "$@"
+# PYTHONPATH=. python scripts/precompute_teacher_logits.py \
+#     --modalities text audio video \
+#     --splits train dev \
+#     --base_teacher \
+#     --no_corrupt \
+#     --corruption_preset medium \
+#     --output_dir ./cache/teacher_medium_logits/base_t+a+v \
+#     "$@"
 # PYTHONPATH=. python scripts/precompute_teacher_logits.py \
 #     --modalities text audio video \
 #     --splits train dev \
 #     --teacher_adapter_path  /project2/robinjia_875/lijc/MLLM-Emotion-and-Affect-Recognition/ckpts/finetuned_base/lora_adapter/ \
 #     --output_dir ./cache/teacher_logits/finetuned_t+a+v \
 #     "$@"
+PYTHONPATH=. python scripts/precompute_teacher_logits.py \
+  --dataset iemocap \
+  --manifest /project2/robinjia_875/lijc/data/IEMOCAP_full_release/manifests/iemocap_utterance_labels.csv \
+  --modalities text audio video \
+  --splits train dev \
+  --base_teacher \
+  --no_corrupt \
+  --output_dir ./cache/teacher_logits/iemocap_base_clean_t+a+v

@@ -1,5 +1,6 @@
 import argparse
 import faulthandler
+import json
 import logging
 import os
 from collections import Counter
@@ -8,6 +9,7 @@ from functools import partial
 
 import torch
 import torch.nn.functional as F
+from torch.utils.data import Subset
 from transformers import (
     Qwen2_5OmniForConditionalGeneration,
     Qwen2_5OmniProcessor,
@@ -32,7 +34,19 @@ from src.finetune import (
     make_compute_metrics,
     preprocess_logits_for_metrics,
 )
-from src.meld_dataset import CORRUPTION_PRESET_NAMES, CorruptedMELDDataset, EMOTION2ID, collate_fn
+from src.meld_dataset import (
+    CORRUPTION_PRESET_NAMES as MELD_CORRUPTION_PRESET_NAMES,
+    CorruptedMELDDataset,
+    EMOTION2ID as MELD_EMOTION2ID,
+    collate_fn as meld_collate_fn,
+)
+from src.iemocap_dataset import (
+    CORRUPTION_PRESET_NAMES as IEMOCAP_CORRUPTION_PRESET_NAMES,
+    CorruptedIEMOCAPDataset,
+    EMOTION2ID as IEMOCAP_EMOTION2ID,
+    collate_fn as iemocap_collate_fn,
+    compute_iemocap_train_val_holdout_split,
+)
 
 
 def set_adapter_trainability(model, adapter_name, trainable):
@@ -299,11 +313,55 @@ class StudentTeacherTrainer(Trainer):
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Finetune Qwen2.5-Omni on MELD emotion recognition")
+    parser = argparse.ArgumentParser(
+        description="Distillation finetune Qwen2.5-Omni on MELD or IEMOCAP emotion recognition",
+    )
+    parser.add_argument("--dataset", default="meld", choices=["meld", "iemocap"],
+                        help="Training corpus (default: meld)")
     parser.add_argument("--model_path", default="./ckpts/Qwen2.5-Omni-7B-GPTQ-Int4",
                         help="Path to the pretrained model")
     parser.add_argument("--data_root", default="/project2/robinjia_875/lijc/data/MELD.Raw",
-                        help="Path to MELD.Raw directory")
+                        help="Path to MELD.Raw directory (MELD only)")
+    parser.add_argument(
+        "--manifest",
+        default=None,
+        help="Path to IEMOCAP utterance manifest CSV (required when --dataset iemocap)",
+    )
+    parser.add_argument(
+        "--iemocap_sessions",
+        nargs="+",
+        default=None,
+        help="Optional IEMOCAP session filter, e.g. Session1 Session2 (IEMOCAP only)",
+    )
+    parser.add_argument(
+        "--iemocap_manifest_split",
+        default=None,
+        help="If the manifest has a 'split' column, keep only rows matching this value (IEMOCAP only)",
+    )
+    parser.add_argument(
+        "--iemocap_holdout_n",
+        type=int,
+        default=500,
+        help="Random eval holdout size excluded from train/val; set 0 to disable (IEMOCAP only).",
+    )
+    parser.add_argument(
+        "--iemocap_holdout_seed",
+        type=int,
+        default=42,
+        help="RNG seed for the IEMOCAP holdout subset",
+    )
+    parser.add_argument(
+        "--iemocap_val_ratio",
+        type=float,
+        default=0.1,
+        help="Fraction of non-holdout samples used for validation (IEMOCAP only); 0 disables val",
+    )
+    parser.add_argument(
+        "--iemocap_split_seed",
+        type=int,
+        default=43,
+        help="RNG seed for shuffling non-holdout rows before train/val split",
+    )
     parser.add_argument("--modalities", nargs="+", default=["text"],
                         choices=["text", "audio", "video"],
                         help="Which modalities to include in the input")
@@ -329,7 +387,6 @@ def parse_args():
                         help="Apply noise/corruption to raw inputs")
     parser.add_argument("--no_corrupt", dest="corrupt", action="store_false")
     parser.add_argument("--corruption_preset", default="medium",
-                        choices=CORRUPTION_PRESET_NAMES,
                         help="Corruption preset to use when --corrupt is enabled")
     parser.add_argument("--modality_mask", action="store_true", default=True,
                         help="Randomly drop modalities from the student branch in distill mode")
@@ -367,7 +424,7 @@ def parse_args():
                              "logits are used for KL.")
     parser.add_argument("--class_weighted_loss", action="store_true", default=False,
                         help="Scale per-sample CE (full and mask) by inverse train-frequency "
-                             "of the ground-truth emotion to combat MELD's neutral imbalance. "
+                             "of the ground-truth emotion to combat class imbalance. "
                              "KL is left unweighted.")
 
     # W&B args
@@ -382,7 +439,22 @@ def parse_args():
     parser.add_argument("--wandb_run_name", type=str, default=None,
                         help="Optional W&B run name")
 
-    return parser.parse_args()
+    args = parser.parse_args()
+    preset_names = (
+        IEMOCAP_CORRUPTION_PRESET_NAMES
+        if args.dataset == "iemocap"
+        else MELD_CORRUPTION_PRESET_NAMES
+    )
+    if args.corruption_preset not in preset_names:
+        parser.error(
+            f"--corruption_preset must be one of {preset_names}, got {args.corruption_preset!r}",
+        )
+    if args.dataset == "iemocap":
+        if not args.manifest:
+            parser.error("--manifest is required when --dataset iemocap")
+        if not 0.0 <= args.iemocap_val_ratio < 1.0:
+            parser.error("--iemocap_val_ratio must be in [0, 1)")
+    return args
 
 
 def resolve_resume_from_checkpoint(resume_from_checkpoint, output_dir):
@@ -419,7 +491,8 @@ def main():
         print("Using cached teacher logits; teacher_adapter_path will not be loaded at train time.")
 
     print(
-        f"Finetuning with modalities={args.modalities}, corrupt={args.corrupt}, "
+        f"Finetuning dataset={args.dataset} with modalities={args.modalities}, "
+        f"corrupt={args.corrupt}, "
         f"corruption_preset={args.corruption_preset}, "
         f"modality_mask={args.modality_mask}, clean_teacher={args.clean_teacher}, "
         f"distill={args.distill}, lambda_kl={args.lambda_kl}, "
@@ -436,6 +509,12 @@ def main():
             os.environ["WANDB_ENTITY"] = args.wandb_entity
 
     processor = Qwen2_5OmniProcessor.from_pretrained(args.model_path)
+    emotion_vocab = IEMOCAP_EMOTION2ID if args.dataset == "iemocap" else MELD_EMOTION2ID
+    emotion_first_token_ids = {
+        emotion: processor.tokenizer(emotion, add_special_tokens=False)["input_ids"][0]
+        for emotion in emotion_vocab
+    }
+
     model = Qwen2_5OmniForConditionalGeneration.from_pretrained(
         args.model_path,
         device_map="auto",
@@ -492,38 +571,87 @@ def main():
             args.distill and args.teacher_logits_dir is not None and args.full_ce_weight == 0
         ),
     )
-    train_logits_dir = (
-        os.path.join(args.teacher_logits_dir, "train")
-        if args.teacher_logits_dir else None
-    )
-    val_logits_dir = (
-        os.path.join(args.teacher_logits_dir, "dev")
-        if args.teacher_logits_dir else None
-    )
-    train_dataset = CorruptedMELDDataset(
-        args.data_root, split="train", teacher_logits_dir=train_logits_dir, **common,
-    )
-    val_dataset = CorruptedMELDDataset(
-        args.data_root, split="dev", teacher_logits_dir=val_logits_dir, **common,
-    )
+    full_iemocap = None
+    train_idx = None
+    if args.dataset == "meld":
+        train_logits_dir = (
+            os.path.join(args.teacher_logits_dir, "train")
+            if args.teacher_logits_dir else None
+        )
+        val_logits_dir = (
+            os.path.join(args.teacher_logits_dir, "dev")
+            if args.teacher_logits_dir else None
+        )
+        train_dataset = CorruptedMELDDataset(
+            args.data_root, split="train", teacher_logits_dir=train_logits_dir, **common,
+        )
+        val_dataset = CorruptedMELDDataset(
+            args.data_root, split="dev", teacher_logits_dir=val_logits_dir, **common,
+        )
+        collate_fn = meld_collate_fn
+    else:
+        train_idx, val_idx, holdout_idx = compute_iemocap_train_val_holdout_split(
+            args.manifest,
+            holdout_n=args.iemocap_holdout_n,
+            holdout_seed=args.iemocap_holdout_seed,
+            val_ratio=args.iemocap_val_ratio,
+            split_seed=args.iemocap_split_seed,
+            sessions=args.iemocap_sessions,
+            split=args.iemocap_manifest_split,
+            drop_no_agreement=True,
+        )
+        os.makedirs(args.output_dir, exist_ok=True)
+        split_record = {
+            "manifest": os.path.abspath(args.manifest),
+            "train_indices": train_idx,
+            "val_indices": val_idx,
+            "holdout_indices": holdout_idx,
+            "holdout_n": args.iemocap_holdout_n,
+            "holdout_seed": args.iemocap_holdout_seed,
+            "val_ratio": args.iemocap_val_ratio,
+            "split_seed": args.iemocap_split_seed,
+            "sessions": args.iemocap_sessions,
+            "manifest_split_filter": args.iemocap_manifest_split,
+        }
+        split_path = os.path.join(args.output_dir, "iemocap_train_val_holdout_indices.json")
+        with open(split_path, "w", encoding="utf-8") as f:
+            json.dump(split_record, f, indent=2)
+        print(
+            f"IEMOCAP split: train={len(train_idx)} val={len(val_idx)} "
+            f"holdout={len(holdout_idx)} (saved {split_path})"
+        )
 
-    emotion_first_token_ids = {
-        emotion: processor.tokenizer(emotion, add_special_tokens=False)["input_ids"][0]
-        for emotion in EMOTION2ID
-    }
+        full_iemocap = CorruptedIEMOCAPDataset(
+            args.manifest,
+            split=args.iemocap_manifest_split,
+            sessions=args.iemocap_sessions,
+            max_samples=None,
+            teacher_logits_dir=args.teacher_logits_dir,
+            **common,
+        )
+        train_dataset = Subset(full_iemocap, train_idx)
+        val_dataset = Subset(full_iemocap, val_idx) if val_idx else None
+        collate_fn = iemocap_collate_fn
 
     token_id_to_weight = None
     if args.class_weighted_loss:
-        emotion_counts = Counter(train_dataset.raw_dataset.df["Emotion"].str.lower())
-        missing = set(EMOTION2ID) - set(emotion_counts)
+        if args.dataset == "meld":
+            emotion_counts = Counter(train_dataset.raw_dataset.df["Emotion"].str.lower())
+        else:
+            raw_df = full_iemocap.raw_dataset.df
+            emotion_counts = Counter(
+                str(raw_df.iloc[int(i)]["emotion"]).strip().lower()
+                for i in train_idx
+            )
+        missing = set(emotion_vocab) - set(emotion_counts)
         if missing:
             raise ValueError(f"Train split is missing emotions: {missing}")
-        class_weights = compute_inverse_freq_weights(emotion_counts)
+        class_weights = compute_inverse_freq_weights(emotion_counts, emotion_vocab)
         token_id_to_weight = {
             emotion_first_token_ids[e]: w for e, w in class_weights.items()
         }
         print("Class-weighted CE enabled. Per-emotion weights:")
-        for emotion in EMOTION2ID:
+        for emotion in emotion_vocab:
             print(f"  {emotion:9s}  count={emotion_counts[emotion]:5d}  "
                   f"weight={class_weights[emotion]:.4f}")
 
@@ -534,8 +662,9 @@ def main():
     )
 
     run_name = args.wandb_run_name or os.path.basename(os.path.abspath(args.output_dir))
+    eval_strategy = "steps" if val_dataset is not None else "no"
 
-    training_args = TrainingArguments(
+    training_args_kw = dict(
         output_dir=args.output_dir,
         num_train_epochs=args.num_epochs,
         per_device_train_batch_size=args.batch_size,
@@ -547,14 +676,17 @@ def main():
         logging_steps=args.logging_steps,
         save_steps=args.save_steps,
         save_total_limit=3,
-        eval_strategy="steps",
-        eval_steps=args.save_steps,
+        eval_strategy=eval_strategy,
         fp16=True,
         report_to="wandb" if args.wandb else "none",
         run_name=run_name,
         remove_unused_columns=False,
         dataloader_num_workers=args.num_workers,
     )
+    if eval_strategy == "steps":
+        training_args_kw["eval_steps"] = args.save_steps
+
+    training_args = TrainingArguments(**training_args_kw)
 
     trainer = StudentTeacherTrainer(
         model=thinker,

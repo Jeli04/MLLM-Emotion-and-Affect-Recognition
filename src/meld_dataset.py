@@ -271,13 +271,6 @@ class RawMELDDataset(Dataset):
 
 
 def load_video_frames(video_path, fps=1, temporal_patch_size=2, max_frames=16):
-    """Decode a video file with decord and sample frames at target fps.
-
-    Rounds the frame count to a multiple of temporal_patch_size (2 for Qwen2.5-Omni).
-    Caps total frames at `max_frames` so a single long clip can't blow up VRAM
-    via thousands of vision tokens. Set max_frames=None to disable the cap.
-    Returns a [N, H, W, C] uint8 numpy array.
-    """
     video_path = _ensure_media_file(video_path)
     vr = decord.VideoReader(str(video_path), num_threads=1)
     total_frames = len(vr)
@@ -313,7 +306,6 @@ def load_audio_from_video(path, target_sr=16000):
 
 
 def corrupt_text(text, char_swap_prob=0.1, word_drop_prob=0.1):
-    """Corrupt text by randomly swapping characters and dropping words."""
     # Word-level dropout
     words = text.split()
     if len(words) > 1:
@@ -340,7 +332,6 @@ def corrupt_audio(waveform, noise_level=0.05):
 
 
 def add_snr_noise(waveform, snr_db):
-    """Add Gaussian noise scaled to a target signal-to-noise ratio."""
     signal_power = float(np.mean(np.square(waveform)))
     if signal_power <= 0:
         noise_std = 0.01
@@ -352,7 +343,6 @@ def add_snr_noise(waveform, snr_db):
 
 
 def apply_audio_dropout(waveform, dropout_ratio, chunks):
-    """Silence random contiguous chunks of audio."""
     corrupted = waveform.astype(np.float32).copy()
     if len(corrupted) == 0 or dropout_ratio <= 0 or chunks <= 0:
         return corrupted
@@ -369,7 +359,6 @@ def apply_audio_dropout(waveform, dropout_ratio, chunks):
 
 
 def apply_lowpass(waveform, sample_rate, cutoff_hz):
-    """Muffle speech with a low-pass filter."""
     if len(waveform) < 16 or cutoff_hz <= 0:
         return waveform
     nyquist = sample_rate / 2.0
@@ -380,7 +369,6 @@ def apply_lowpass(waveform, sample_rate, cutoff_hz):
 
 
 def apply_audio_corruptions(waveform, sample_rate, config):
-    """Apply configured audio corruptions in order."""
     corrupted = waveform.astype(np.float32).copy()
     for corruption in config["audio_corruptions"]:
         if corruption == "noise":
@@ -435,7 +423,6 @@ def apply_video_blur(frames, radius):
 
 
 def _convolve_frame_per_channel(frame, kernel):
-    """2D convolve a uint8 HxWxC frame with a 2D float kernel, per channel."""
     from scipy.ndimage import convolve as nd_convolve
     out = np.empty_like(frame, dtype=np.float32)
     for c in range(frame.shape[-1]):
@@ -444,12 +431,7 @@ def _convolve_frame_per_channel(frame, kernel):
 
 
 def apply_video_motion_blur(frames, kernel_size, angle_deg=None):
-    """Linear motion blur: convolve each frame with a 1-pixel-wide line kernel.
 
-    A larger `kernel_size` corresponds to longer motion. If `angle_deg` is None,
-    a random angle in [0, 180) is drawn once per call (same angle across frames,
-    so the motion direction is consistent for the clip).
-    """
     kernel_size = max(1, int(kernel_size))
     if kernel_size <= 1:
         return frames
@@ -473,7 +455,6 @@ def apply_video_motion_blur(frames, kernel_size, angle_deg=None):
 
 
 def apply_video_defocus_blur(frames, radius):
-    """Defocus blur: convolve each frame with a uniform disk kernel of given radius."""
     radius = float(radius)
     if radius <= 0.5:
         return frames
@@ -560,7 +541,6 @@ def apply_video_jpeg(frames, quality):
 
 
 def apply_video_corruptions(frames, config):
-    """Apply configured video corruptions in order."""
     corrupted = frames.astype(np.uint8).copy()
     for corruption in config["video_corruptions"]:
         if corruption == "noise":
@@ -595,9 +575,6 @@ def apply_video_corruptions(frames, config):
 
 
 def corrupt_video_frames(video_path, noise_level=0.05):
-    """Return the video path as-is; frame-level noise is applied post-processor
-    on pixel_values_videos in the collate function. This is a placeholder so the
-    dataset can flag that corruption is enabled."""
     return video_path
 
 def get_corrupted_modalities(modalities, corrupt):
@@ -616,7 +593,6 @@ def format_assistant_response(sample, modalities, corrupt, predict_corruption=Fa
 
 
 def build_messages(sample, modalities, corrupt=False, predict_corruption=False):
-    """Build chat messages for a single sample (same format as evaluate.py)."""
     user_content = []
     for mod in modalities:
         if mod == "text":
@@ -643,18 +619,6 @@ def build_messages(sample, modalities, corrupt=False, predict_corruption=False):
 
 
 class CorruptedMELDDataset(Dataset):
-    """MELD dataset with optional corruption applied to raw modality data.
-
-    Loads raw video frames, audio waveforms, and text, then runs the
-    processor to produce model-ready inputs.
-
-    When `distill=True`, __getitem__ returns a paired {"full": ..., "mask": ...}
-    dict unless `include_full_branch=False`. The full item uses all modalities;
-    the mask item uses either all modalities or a random non-empty strict subset,
-    depending on `modality_mask`. By default corruption is shared across both
-    passes; with `clean_teacher=True`, the full branch stays uncorrupted while
-    the mask branch follows the corruption setting.
-    """
 
     def __init__(
         self,
@@ -750,11 +714,7 @@ class CorruptedMELDDataset(Dataset):
         return load_video_frames(video_path, fps=fps)
 
     def _process(self, sample, text, frames, waveform, modalities):
-        """Render chat + run processor for one modality configuration.
 
-        `frames` / `waveform` are pre-loaded (and pre-corrupted) raw media or
-        None; this method only includes them if `modalities` asks for them.
-        """
         has_video = "video" in modalities
         has_audio = "audio" in modalities
 
@@ -772,10 +732,6 @@ class CorruptedMELDDataset(Dataset):
                 messages[:-1], tokenize=False, add_generation_prompt=True,
             )
         else:
-            # messages[-1] is the assistant turn carrying the ground-truth
-            # label. Drop it before rendering so the model generates from the
-            # prompt without seeing the answer. add_generation_prompt=True
-            # appends the marker where generation begins.
             rendered_text = self.processor.apply_chat_template(
                 messages[:-1], tokenize=False, add_generation_prompt=True,
             )
@@ -800,9 +756,7 @@ class CorruptedMELDDataset(Dataset):
             prompt_inputs = self.processor(text=prompt_rendered, **processor_kwargs)
             prompt_len = int(prompt_inputs["input_ids"].shape[-1])
 
-        # Only squeeze keys that carry a real batch dim from the processor.
-        # Video/audio "count" dims (video_grid_thw, video_second_per_grid, pixel_values_videos)
-        # are semantic, not batch — squeezing them breaks collation when N=1.
+
         BATCH_DIM_KEYS = {"input_ids", "attention_mask", "input_features", "feature_attention_mask"}
         result = {
             k: (v.squeeze(0) if isinstance(v, torch.Tensor) and k in BATCH_DIM_KEYS else v)
@@ -841,22 +795,17 @@ class CorruptedMELDDataset(Dataset):
         sample = self.raw_dataset[idx]
 
         text = sample["text"]
-
-        # If a file is missing or unreadable, fall back to a zero-filled tensor
-        # so the sample still contributes (with padding) rather than crashing.
         frames = None
         waveform = None
         if "video" in self.modalities:
             try:
                 clean_frames = self._load_video_frames(sample["video_path"], self.fps)
             except Exception:
-                # 2 black frames (minimum for temporal_patch_size=2), 224×224 RGB
                 frames = np.zeros((2, 224, 224, 3), dtype=np.uint8)
         if "audio" in self.modalities:
             try:
                 clean_waveform, _ = load_audio_from_video(sample["video_path"], target_sr=self.audio_sr)
             except Exception:
-                # 1 second of silence at the target sample rate
                 waveform = np.zeros(self.audio_sr, dtype=np.float32)
 
         if self.distill:
@@ -910,7 +859,6 @@ class CorruptedMELDDataset(Dataset):
 
 
 def _collate_single(batch, pad_token_id, padding_side, label_pad_id):
-    """Collate a flat list of per-sample dicts (no 'full'/'mask' nesting)."""
     def pad_1d(seqs, pad_value):
         max_len = max(s.size(0) for s in seqs)
         out = []
@@ -938,8 +886,6 @@ def _collate_single(batch, pad_token_id, padding_side, label_pad_id):
         "attention_mask": pad_1d([b["attention_mask"] for b in batch], 0),
     }
 
-    # Guard against samples in a batch with different modality presence: in
-    # distill mode the mask variant may omit video/audio for some samples.
     video_samples = [b for b in batch if "pixel_values_videos" in b]
     if video_samples:
         out["pixel_values_videos"] = torch.cat([b["pixel_values_videos"] for b in video_samples], dim=0)
@@ -977,20 +923,7 @@ def _collate_single(batch, pad_token_id, padding_side, label_pad_id):
 
 
 def collate_fn(batch, pad_token_id, padding_side="left", label_pad_id=-100):
-    """Collate per-sample dicts from CorruptedMELDDataset into a padded batch.
 
-    Text is padded to max length; video patches and grid_thw are concatenated
-    along dim 0 (token-packed, not stackable); audio features are right-padded
-    along the frames dim.
-
-    If samples carry `prompt_len`, builds an HF-Trainer-ready `labels` tensor
-    where prompt and padding positions are masked to `label_pad_id`.
-
-    If samples are paired {"full": ..., "mask": ...} or cached-teacher
-    {"mask": ...} items (distill mode), returns collated branches plus a
-    top-level "labels" key so HF Trainer's num_items_in_batch accounting can
-    find a labels tensor.
-    """
     if "full" in batch[0] or "mask" in batch[0]:
         mask = _collate_single([b["mask"] for b in batch], pad_token_id, padding_side, label_pad_id)
         out = {"mask": mask}

@@ -1,0 +1,722 @@
+import argparse
+import faulthandler
+import json
+import logging
+import os
+from collections import Counter
+from contextlib import nullcontext
+from functools import partial
+
+import torch
+import torch.nn.functional as F
+from torch.utils.data import Subset
+from transformers import (
+    Qwen2_5OmniForConditionalGeneration,
+    Qwen2_5OmniProcessor,
+    TrainingArguments,
+    Trainer,
+)
+from transformers.trainer_utils import get_last_checkpoint
+from peft import LoraConfig, get_peft_model, TaskType
+
+faulthandler.enable(all_threads=True)
+
+logging.getLogger().addFilter(
+    lambda r: "System prompt modified" not in r.getMessage()
+)
+
+# Patch optimum to recognize Qwen2.5-Omni's layer structure
+import optimum.gptq.constants
+optimum.gptq.constants.BLOCK_PATTERNS.insert(0, "thinker.model.layers")
+
+from src.finetune import (
+    compute_inverse_freq_weights,
+    make_compute_metrics,
+    preprocess_logits_for_metrics,
+)
+from src.meld_dataset import (
+    CORRUPTION_PRESET_NAMES as MELD_CORRUPTION_PRESET_NAMES,
+    CorruptedMELDDataset,
+    EMOTION2ID as MELD_EMOTION2ID,
+    collate_fn as meld_collate_fn,
+)
+from src.iemocap_dataset import (
+    CORRUPTION_PRESET_NAMES as IEMOCAP_CORRUPTION_PRESET_NAMES,
+    CorruptedIEMOCAPDataset,
+    EMOTION2ID as IEMOCAP_EMOTION2ID,
+    collate_fn as iemocap_collate_fn,
+    compute_iemocap_train_val_holdout_split,
+)
+
+
+def set_adapter_trainability(model, adapter_name, trainable):
+    marker = f".{adapter_name}."
+    for name, param in model.named_parameters():
+        if marker in name:
+            param.requires_grad = trainable
+
+
+class StudentTeacherTrainer(Trainer):
+    """Trainer for paired full/masked inputs.
+
+    Distill mode optimizes weighted CE on both full and masked student inputs,
+    plus lambda*KL(sg(p_teacher_full) || p_student_mask). It falls back to the
+    default CE path for unpaired inputs, so non-distill runs are unaffected.
+    """
+
+    def __init__(
+        self,
+        *args,
+        lambda_kl=0.1,
+        distill_temperature=2.0,
+        full_ce_weight=0.5,
+        mask_ce_weight=0.5,
+        student_adapter_name="default",
+        teacher_adapter_name=None,
+        base_teacher=False,
+        token_id_to_weight=None,
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+        self.lambda_kl = lambda_kl
+        if distill_temperature <= 0:
+            raise ValueError("distill_temperature must be > 0")
+        if full_ce_weight < 0 or mask_ce_weight < 0:
+            raise ValueError("CE weights must be non-negative")
+        self.distill_temperature = distill_temperature
+        self.full_ce_weight = full_ce_weight
+        self.mask_ce_weight = mask_ce_weight
+        self.student_adapter_name = student_adapter_name
+        self.teacher_adapter_name = teacher_adapter_name
+        self.base_teacher = base_teacher
+        self.token_id_to_weight = dict(token_id_to_weight or {})
+
+    def _sample_weights(self, labels):
+        """Return [B] tensor of per-sample weights from each row's first response token."""
+        B = labels.size(0)
+        device = labels.device
+        weights = torch.ones(B, device=device, dtype=torch.float32)
+        if not self.token_id_to_weight:
+            return weights
+        for i in range(B):
+            resp_idx = (labels[i] != -100).nonzero(as_tuple=True)[0]
+            if resp_idx.numel() == 0:
+                continue
+            first_tok = int(labels[i, resp_idx[0]].item())
+            w = self.token_id_to_weight.get(first_tok)
+            if w is not None:
+                weights[i] = w
+        return weights
+
+    def _weighted_response_ce(self, logits, labels):
+        """CE over response tokens, weighted per-sample by class weight if enabled."""
+        shift_logits = logits[..., :-1, :]
+        shift_labels = labels[..., 1:]
+        keep = shift_labels != -100
+        if keep.sum() == 0:
+            return torch.zeros((), device=logits.device, dtype=logits.dtype)
+
+        selected_logits = shift_logits[keep].float()
+        selected_labels = shift_labels[keep]
+
+        if not self.token_id_to_weight:
+            return F.cross_entropy(selected_logits, selected_labels)
+
+        per_tok_ce = F.cross_entropy(
+            shift_logits.reshape(-1, shift_logits.size(-1)).float(),
+            shift_labels.reshape(-1),
+            reduction="none",
+            ignore_index=-100,
+        ).view(shift_labels.shape)
+        valid = keep.to(per_tok_ce.dtype)
+        denom = valid.sum(dim=1).clamp(min=1.0)
+        per_sample_loss = (per_tok_ce * valid).sum(dim=1) / denom
+
+        sample_weights = self._sample_weights(labels).to(per_sample_loss.dtype)
+        return (per_sample_loss * sample_weights).mean()
+
+    def _set_adapter(self, model, adapter_name, trainable=None):
+        if adapter_name is not None and hasattr(model, "set_adapter"):
+            model.set_adapter(adapter_name)
+            if trainable is not None:
+                set_adapter_trainability(model, adapter_name, trainable)
+
+    def _teacher_forward(self, model, full_inputs_no_labels, full_student_out):
+        if self.teacher_adapter_name is None and not self.base_teacher:
+            return full_student_out
+
+        was_training = model.training
+        teacher_context = nullcontext()
+        if self.teacher_adapter_name is not None:
+            self._set_adapter(model, self.teacher_adapter_name, trainable=False)
+        else:
+            teacher_context = model.disable_adapter()
+
+        model.eval()
+        # Bypass accelerate's ConvertOutputsToFp32 wrapper on model.forward —
+        # it would cast the full [B, T, V] logits to fp32, costing ~8 GB
+        # transient memory we don't need (KL/CE only cast the response slice).
+        inner_forward = getattr(model.forward, "model_forward", model.forward)
+        with torch.no_grad(), teacher_context:
+            teacher_out = inner_forward(**full_inputs_no_labels)
+        if was_training:
+            model.train()
+        self._set_adapter(model, self.student_adapter_name, trainable=True)
+        return teacher_out
+
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        is_cached_distill = "mask" in inputs and "teacher_response_logits" in inputs
+        if ("full" not in inputs or "mask" not in inputs) and not is_cached_distill:
+            return super().compute_loss(
+                model, inputs,
+                return_outputs=return_outputs,
+                num_items_in_batch=num_items_in_batch,
+            )
+
+        full_inputs = inputs.get("full")
+        full_inputs_no_labels = (
+            {k: v for k, v in full_inputs.items() if k != "labels"}
+            if full_inputs is not None
+            else None
+        )
+        mask_inputs = inputs["mask"]
+        mask_inputs_no_labels = {k: v for k, v in mask_inputs.items() if k != "labels"}
+
+        self._set_adapter(model, self.student_adapter_name, trainable=True)
+        use_cached_teacher = "teacher_response_logits" in inputs
+        needs_full_student = (
+            full_inputs is not None
+            and (
+                self.full_ce_weight > 0
+                or (
+                    not use_cached_teacher
+                    and self.teacher_adapter_name is None
+                    and not self.base_teacher
+                )
+            )
+        )
+        if full_inputs is None and (
+            self.full_ce_weight > 0
+            or (
+                not use_cached_teacher
+                and self.teacher_adapter_name is None
+                and not self.base_teacher
+            )
+        ):
+            raise ValueError("Distillation needs full inputs, but the batch only has mask inputs")
+
+        def response_logits_and_labels(logits, labels):
+            # Only gather supervised response row to reduce memory
+            shift_logits = logits[..., :-1, :]
+            shift_labels = labels[..., 1:]
+            keep = shift_labels != -100
+            return shift_logits[keep], shift_labels[keep]
+
+        full_student_out = model(**full_inputs_no_labels) if needs_full_student else None
+        mask_out = model(**mask_inputs_no_labels)
+        student_resp, student_labels = response_logits_and_labels(
+            mask_out.logits, mask_inputs["labels"],
+        )
+
+        if student_resp.numel() == 0:
+            mask_ce_loss = torch.zeros((), device=mask_out.logits.device, dtype=mask_out.logits.dtype)
+        else:
+            mask_ce_loss = self._weighted_response_ce(
+                mask_out.logits, mask_inputs["labels"],
+            )
+
+        if full_student_out is not None:
+            full_resp, full_labels = response_logits_and_labels(
+                full_student_out.logits, full_inputs["labels"],
+            )
+            full_ce_loss = (
+                self._weighted_response_ce(full_student_out.logits, full_inputs["labels"])
+                if full_resp.numel() > 0
+                else torch.zeros((), device=mask_ce_loss.device, dtype=mask_ce_loss.dtype)
+            )
+        else:
+            full_ce_loss = torch.zeros((), device=mask_ce_loss.device, dtype=mask_ce_loss.dtype)
+        ce_loss = self.full_ce_weight * full_ce_loss + self.mask_ce_weight * mask_ce_loss
+
+        if use_cached_teacher:
+            device = mask_out.logits.device
+            teacher_resp = torch.cat(
+                [t.to(device) for t in inputs["teacher_response_logits"]], dim=0
+            ).detach()
+            teacher_labels = torch.cat(
+                [t.to(device) for t in inputs["teacher_response_labels"]], dim=0
+            ).detach()
+        else:
+            teacher_out = self._teacher_forward(
+                model, full_inputs_no_labels, full_student_out,
+            )
+            teacher_logits = teacher_out.logits.detach()
+            teacher_resp, teacher_labels = response_logits_and_labels(
+                teacher_logits, full_inputs["labels"],
+            )
+            teacher_labels = teacher_labels.detach()
+
+        # checks for cases where teacher output is completely empty
+        if teacher_resp.numel() == 0:
+            teacher_nll = torch.zeros((), device=ce_loss.device)
+            teacher_token_acc = torch.zeros((), device=ce_loss.device)
+        else:
+            teacher_nll = F.cross_entropy(teacher_resp.float(), teacher_labels)
+            teacher_token_acc = (
+                teacher_resp.argmax(dim=-1).eq(teacher_labels).float().mean()
+            )
+
+        # checks for cases where the student output is nothing if all the modalilites are masked out
+        if student_resp.numel() == 0 or student_resp.shape != teacher_resp.shape:
+            loss = ce_loss
+            kl_val = torch.zeros((), device=ce_loss.device)
+            kl_raw_val = kl_val
+            kl_weighted_val = kl_val
+        else:
+            # KL in fp32 for numerical stability under fp16 training.
+            t = self.distill_temperature
+            log_p_mask = F.log_softmax(student_resp.float() / t, dim=-1)
+            p_full = F.softmax(teacher_resp.float() / t, dim=-1)
+            kl_raw = F.kl_div(log_p_mask, p_full, reduction="batchmean")
+            kl = kl_raw * (t ** 2)
+            kl_weighted = self.lambda_kl * kl
+            loss = ce_loss + kl_weighted
+            kl_val = kl.detach()
+            kl_raw_val = kl_raw.detach()
+            kl_weighted_val = kl_weighted.detach()
+
+        self._last_ce = ce_loss.detach()
+        self._last_full_ce = full_ce_loss.detach()
+        self._last_mask_ce = mask_ce_loss.detach()
+        self._last_kl = kl_val
+        self._last_kl_raw = kl_raw_val
+        self._last_kl_weighted = kl_weighted_val
+        self._last_teacher_nll = teacher_nll.detach()
+        self._last_teacher_token_acc = teacher_token_acc.detach()
+
+        return (loss, mask_out) if return_outputs else loss
+
+    def log(self, logs, *args, **kwargs):
+        if hasattr(self, "_last_ce"):
+            logs = {
+                **logs,
+                "loss/ce": float(self._last_ce),
+                "loss/full_ce": float(self._last_full_ce),
+                "loss/mask_ce": float(self._last_mask_ce),
+                "loss/kl": float(self._last_kl),
+                "loss/kl_raw": float(self._last_kl_raw),
+                "loss/kl_weighted": float(self._last_kl_weighted),
+                "teacher/nll": float(self._last_teacher_nll),
+                "teacher/token_acc": float(self._last_teacher_token_acc),
+            }
+        return super().log(logs, *args, **kwargs)
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Distillation finetune Qwen2.5-Omni on MELD or IEMOCAP emotion recognition",
+    )
+    parser.add_argument("--dataset", default="meld", choices=["meld", "iemocap"],
+                        help="Training corpus (default: meld)")
+    parser.add_argument("--model_path", default="./ckpts/Qwen2.5-Omni-7B-GPTQ-Int4",
+                        help="Path to the pretrained model")
+    parser.add_argument("--data_root", default="/project2/robinjia_875/lijc/data/MELD.Raw",
+                        help="Path to MELD.Raw directory (MELD only)")
+    parser.add_argument(
+        "--manifest",
+        default=None,
+        help="Path to IEMOCAP utterance manifest CSV (required when --dataset iemocap)",
+    )
+    parser.add_argument(
+        "--iemocap_sessions",
+        nargs="+",
+        default=None,
+        help="Optional IEMOCAP session filter, e.g. Session1 Session2 (IEMOCAP only)",
+    )
+    parser.add_argument(
+        "--iemocap_manifest_split",
+        default=None,
+        help="If the manifest has a 'split' column, keep only rows matching this value (IEMOCAP only)",
+    )
+    parser.add_argument(
+        "--iemocap_holdout_n",
+        type=int,
+        default=500,
+        help="Random eval holdout size excluded from train/val; set 0 to disable (IEMOCAP only).",
+    )
+    parser.add_argument(
+        "--iemocap_holdout_seed",
+        type=int,
+        default=42,
+        help="RNG seed for the IEMOCAP holdout subset",
+    )
+    parser.add_argument(
+        "--iemocap_val_ratio",
+        type=float,
+        default=0.1,
+        help="Fraction of non-holdout samples used for validation (IEMOCAP only); 0 disables val",
+    )
+    parser.add_argument(
+        "--iemocap_split_seed",
+        type=int,
+        default=43,
+        help="RNG seed for shuffling non-holdout rows before train/val split",
+    )
+    parser.add_argument("--modalities", nargs="+", default=["text"],
+                        choices=["text", "audio", "video"],
+                        help="Which modalities to include in the input")
+    parser.add_argument("--output_dir", default="./ckpts/finetuned",
+                        help="Directory to save finetuned model")
+    parser.add_argument("--num_epochs", type=int, default=3)
+    parser.add_argument("--batch_size", type=int, default=1)
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=8)
+    parser.add_argument("--learning_rate", type=float, default=1e-4)
+    parser.add_argument("--lora_r", type=int, default=16)
+    parser.add_argument("--lora_alpha", type=int, default=32)
+    parser.add_argument("--lora_dropout", type=float, default=0.05)
+    parser.add_argument("--logging_steps", type=int, default=10)
+    parser.add_argument("--num_workers", type=int, default=4,
+                        help="DataLoader worker processes (parallel video/audio decoding)")
+    parser.add_argument("--save_steps", type=int, default=200)
+    parser.add_argument("--resume_from_checkpoint", type=str, default=None,
+                        help="Path to a checkpoint dir to resume from (e.g. "
+                             "./ckpts/finetuned_distill/checkpoint-1800). "
+                             "Pass 'true', 'latest', or 'auto' to use the "
+                             "latest checkpoint in output_dir.")
+    parser.add_argument("--corrupt", action="store_true", default=True,
+                        help="Apply noise/corruption to raw inputs")
+    parser.add_argument("--no_corrupt", dest="corrupt", action="store_false")
+    parser.add_argument("--corruption_preset", default="medium",
+                        help="Corruption preset to use when --corrupt is enabled")
+    parser.add_argument("--modality_mask", action="store_true", default=True,
+                        help="Randomly drop modalities from the student branch in distill mode")
+    parser.add_argument("--no_modality_mask", dest="modality_mask", action="store_false",
+                        help="Disable modality dropout; corruption can still be applied")
+    parser.add_argument("--clean_teacher", action="store_true", default=False,
+                        help="In distill mode, keep the full/teacher branch uncorrupted "
+                             "while the mask/student branch follows --corrupt")
+
+    parser.add_argument("--distill", action="store_true", default=False,
+                        help="Enable student-teacher distillation: two forward passes "
+                             "per sample (full modalities vs. random masked subset), "
+                             "loss = weighted CE(full/mask student) + "
+                             "lambda_kl * KL(sg(p_teacher_full) || p_student_mask).")
+    parser.add_argument("--lambda_kl", type=float, default=0.1,
+                        help="Weight on the KL consistency term when --distill is set")
+    parser.add_argument("--distill_temperature", type=float, default=2.0,
+                        help="Temperature for distillation soft targets. The KL term "
+                             "is multiplied by temperature^2.")
+    parser.add_argument("--full_ce_weight", type=float, default=0.5,
+                        help="Weight for full-modality student CE in distill mode")
+    parser.add_argument("--mask_ce_weight", type=float, default=0.5,
+                        help="Weight for masked-modality student CE in distill mode")
+    parser.add_argument("--teacher_adapter_path", type=str, default=None,
+                        help="Optional LoRA adapter path for a frozen full-modality "
+                             "teacher. If omitted, the full-modality student pass is "
+                             "used as an online adapter-enabled teacher.")
+    parser.add_argument("--base_teacher", action="store_true", default=False,
+                        help="Use the frozen base model with adapters disabled as the "
+                             "teacher. Ignored when --teacher_adapter_path is set.")
+    parser.add_argument("--teacher_logits_dir", type=str, default=None,
+                        help="Directory of precomputed teacher response-slice logits "
+                             "(produced by scripts/precompute_teacher_logits.py). When "
+                             "set, the live teacher forward is skipped and cached "
+                             "logits are used for KL.")
+    parser.add_argument("--class_weighted_loss", action="store_true", default=False,
+                        help="Scale per-sample CE (full and mask) by inverse train-frequency "
+                             "of the ground-truth emotion to combat class imbalance. "
+                             "KL is left unweighted.")
+
+    # W&B args
+    parser.add_argument("--wandb", dest="wandb", action="store_true", default=True,
+                        help="Enable Weights & Biases logging")
+    parser.add_argument("--no_wandb", dest="wandb", action="store_false",
+                        help="Disable Weights & Biases logging")
+    parser.add_argument("--wandb_project", type=str, default="qwen25-omni-meld",
+                        help="W&B project name")
+    parser.add_argument("--wandb_entity", type=str, default=None,
+                        help="W&B entity/team name")
+    parser.add_argument("--wandb_run_name", type=str, default=None,
+                        help="Optional W&B run name")
+
+    args = parser.parse_args()
+    preset_names = (
+        IEMOCAP_CORRUPTION_PRESET_NAMES
+        if args.dataset == "iemocap"
+        else MELD_CORRUPTION_PRESET_NAMES
+    )
+    if args.corruption_preset not in preset_names:
+        parser.error(
+            f"--corruption_preset must be one of {preset_names}, got {args.corruption_preset!r}",
+        )
+    if args.dataset == "iemocap":
+        if not args.manifest:
+            parser.error("--manifest is required when --dataset iemocap")
+        if not 0.0 <= args.iemocap_val_ratio < 1.0:
+            parser.error("--iemocap_val_ratio must be in [0, 1)")
+    return args
+
+
+def resolve_resume_from_checkpoint(resume_from_checkpoint, output_dir):
+    if resume_from_checkpoint is None:
+        return None
+
+    value = resume_from_checkpoint.strip()
+    lower = value.lower()
+    if lower in {"false", "0", "no", "none"}:
+        return None
+
+    if lower in {"true", "1", "yes", "latest", "auto"}:
+        checkpoint = get_last_checkpoint(output_dir)
+        if checkpoint is None:
+            raise ValueError(
+                "--resume_from_checkpoint requested auto-resume, but no "
+                f"checkpoint-* directory was found in {output_dir!r}."
+            )
+        print(f"Resuming from latest checkpoint: {checkpoint}")
+        return checkpoint
+
+    if not os.path.isdir(value):
+        raise ValueError(
+            f"--resume_from_checkpoint points to a missing directory: {value}"
+        )
+    print(f"Resuming from checkpoint: {value}")
+    return value
+
+
+def main():
+    args = parse_args()
+    using_cached_teacher = args.distill and args.teacher_logits_dir is not None
+    if using_cached_teacher and args.teacher_adapter_path is not None:
+        print("Using cached teacher logits; teacher_adapter_path will not be loaded at train time.")
+
+    print(
+        f"Finetuning dataset={args.dataset} with modalities={args.modalities}, "
+        f"corrupt={args.corrupt}, "
+        f"corruption_preset={args.corruption_preset}, "
+        f"modality_mask={args.modality_mask}, clean_teacher={args.clean_teacher}, "
+        f"distill={args.distill}, lambda_kl={args.lambda_kl}, "
+        f"distill_temperature={args.distill_temperature}, "
+        f"full_ce_weight={args.full_ce_weight}, mask_ce_weight={args.mask_ce_weight}, "
+        f"teacher_adapter_path={args.teacher_adapter_path}, base_teacher={args.base_teacher}, "
+        f"wandb={args.wandb}"
+    )
+
+    # Set W&B env vars before Trainer is created
+    if args.wandb:
+        os.environ["WANDB_PROJECT"] = args.wandb_project
+        if args.wandb_entity is not None:
+            os.environ["WANDB_ENTITY"] = args.wandb_entity
+
+    processor = Qwen2_5OmniProcessor.from_pretrained(args.model_path)
+    emotion_vocab = IEMOCAP_EMOTION2ID if args.dataset == "iemocap" else MELD_EMOTION2ID
+    emotion_first_token_ids = {
+        emotion: processor.tokenizer(emotion, add_special_tokens=False)["input_ids"][0]
+        for emotion in emotion_vocab
+    }
+
+    model = Qwen2_5OmniForConditionalGeneration.from_pretrained(
+        args.model_path,
+        device_map="auto",
+        torch_dtype=torch.float16,
+    )
+
+    lora_config = LoraConfig(
+        r=args.lora_r,
+        lora_alpha=args.lora_alpha,
+        lora_dropout=args.lora_dropout,
+        target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],#["q_proj", "v_proj"],
+        task_type=TaskType.CAUSAL_LM,
+    )
+
+    thinker = get_peft_model(model.thinker, lora_config)
+    teacher_adapter_name = None
+    if args.teacher_adapter_path is not None and not using_cached_teacher:
+        teacher_adapter_name = "teacher"
+        thinker.load_adapter(
+            args.teacher_adapter_path,
+            adapter_name=teacher_adapter_name,
+            is_trainable=False,
+        )
+        set_adapter_trainability(thinker, teacher_adapter_name, False)
+        thinker.set_adapter("default")
+
+    # remove unused speech-generation side
+    if hasattr(model, "talker"):
+        del model.talker
+    if hasattr(model, "token2wav"):
+        del model.token2wav
+    if hasattr(model, "audio_tokenizer"):
+        del model.audio_tokenizer
+    del model
+    torch.cuda.empty_cache()
+
+    # Required when grad checkpointing with a frozen base: forces the embedding
+    # output to require_grad so the autograd graph reaches LoRA adapters.
+    if hasattr(thinker, "enable_input_require_grads"):
+        thinker.enable_input_require_grads()
+    thinker.gradient_checkpointing_enable()
+    thinker.print_trainable_parameters()
+
+    common = dict(
+        processor=processor,
+        modalities=tuple(args.modalities),
+        corrupt=args.corrupt,
+        corruption_preset=args.corruption_preset,
+        for_training=True,
+        distill=args.distill,
+        modality_mask=args.modality_mask,
+        clean_teacher=args.clean_teacher,
+        include_full_branch=not (
+            args.distill and args.teacher_logits_dir is not None and args.full_ce_weight == 0
+        ),
+    )
+    full_iemocap = None
+    train_idx = None
+    if args.dataset == "meld":
+        train_logits_dir = (
+            os.path.join(args.teacher_logits_dir, "train")
+            if args.teacher_logits_dir else None
+        )
+        val_logits_dir = (
+            os.path.join(args.teacher_logits_dir, "dev")
+            if args.teacher_logits_dir else None
+        )
+        train_dataset = CorruptedMELDDataset(
+            args.data_root, split="train", teacher_logits_dir=train_logits_dir, **common,
+        )
+        val_dataset = CorruptedMELDDataset(
+            args.data_root, split="dev", teacher_logits_dir=val_logits_dir, **common,
+        )
+        collate_fn = meld_collate_fn
+    else:
+        train_idx, val_idx, holdout_idx = compute_iemocap_train_val_holdout_split(
+            args.manifest,
+            holdout_n=args.iemocap_holdout_n,
+            holdout_seed=args.iemocap_holdout_seed,
+            val_ratio=args.iemocap_val_ratio,
+            split_seed=args.iemocap_split_seed,
+            sessions=args.iemocap_sessions,
+            split=args.iemocap_manifest_split,
+            drop_no_agreement=True,
+        )
+        os.makedirs(args.output_dir, exist_ok=True)
+        split_record = {
+            "manifest": os.path.abspath(args.manifest),
+            "train_indices": train_idx,
+            "val_indices": val_idx,
+            "holdout_indices": holdout_idx,
+            "holdout_n": args.iemocap_holdout_n,
+            "holdout_seed": args.iemocap_holdout_seed,
+            "val_ratio": args.iemocap_val_ratio,
+            "split_seed": args.iemocap_split_seed,
+            "sessions": args.iemocap_sessions,
+            "manifest_split_filter": args.iemocap_manifest_split,
+        }
+        split_path = os.path.join(args.output_dir, "iemocap_train_val_holdout_indices.json")
+        with open(split_path, "w", encoding="utf-8") as f:
+            json.dump(split_record, f, indent=2)
+        print(
+            f"IEMOCAP split: train={len(train_idx)} val={len(val_idx)} "
+            f"holdout={len(holdout_idx)} (saved {split_path})"
+        )
+
+        full_iemocap = CorruptedIEMOCAPDataset(
+            args.manifest,
+            split=args.iemocap_manifest_split,
+            sessions=args.iemocap_sessions,
+            max_samples=None,
+            teacher_logits_dir=args.teacher_logits_dir,
+            **common,
+        )
+        train_dataset = Subset(full_iemocap, train_idx)
+        val_dataset = Subset(full_iemocap, val_idx) if val_idx else None
+        collate_fn = iemocap_collate_fn
+
+    token_id_to_weight = None
+    if args.class_weighted_loss:
+        if args.dataset == "meld":
+            emotion_counts = Counter(train_dataset.raw_dataset.df["Emotion"].str.lower())
+        else:
+            raw_df = full_iemocap.raw_dataset.df
+            emotion_counts = Counter(
+                str(raw_df.iloc[int(i)]["emotion"]).strip().lower()
+                for i in train_idx
+            )
+        missing = set(emotion_vocab) - set(emotion_counts)
+        if missing:
+            raise ValueError(f"Train split is missing emotions: {missing}")
+        class_weights = compute_inverse_freq_weights(emotion_counts, emotion_vocab)
+        token_id_to_weight = {
+            emotion_first_token_ids[e]: w for e, w in class_weights.items()
+        }
+        print("Class-weighted CE enabled. Per-emotion weights:")
+        for emotion in emotion_vocab:
+            print(f"  {emotion:9s}  count={emotion_counts[emotion]:5d}  "
+                  f"weight={class_weights[emotion]:.4f}")
+
+    data_collator = partial(
+        collate_fn,
+        pad_token_id=processor.tokenizer.pad_token_id,
+        padding_side="right",
+    )
+
+    run_name = args.wandb_run_name or os.path.basename(os.path.abspath(args.output_dir))
+    eval_strategy = "steps" if val_dataset is not None else "no"
+
+    training_args_kw = dict(
+        output_dir=args.output_dir,
+        num_train_epochs=args.num_epochs,
+        per_device_train_batch_size=args.batch_size,
+        per_device_eval_batch_size=args.batch_size,
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
+        learning_rate=args.learning_rate,
+        lr_scheduler_type="cosine",
+        warmup_ratio=0.05,
+        logging_steps=args.logging_steps,
+        save_steps=args.save_steps,
+        save_total_limit=3,
+        eval_strategy=eval_strategy,
+        fp16=True,
+        report_to="wandb" if args.wandb else "none",
+        run_name=run_name,
+        remove_unused_columns=False,
+        dataloader_num_workers=args.num_workers,
+    )
+    if eval_strategy == "steps":
+        training_args_kw["eval_steps"] = args.save_steps
+
+    training_args = TrainingArguments(**training_args_kw)
+
+    trainer = StudentTeacherTrainer(
+        model=thinker,
+        args=training_args,
+        train_dataset=train_dataset,
+        eval_dataset=val_dataset,
+        data_collator=data_collator,
+        compute_metrics=make_compute_metrics(emotion_first_token_ids),
+        preprocess_logits_for_metrics=preprocess_logits_for_metrics,
+        lambda_kl=args.lambda_kl,
+        distill_temperature=args.distill_temperature,
+        full_ce_weight=args.full_ce_weight,
+        mask_ce_weight=args.mask_ce_weight,
+        student_adapter_name="default",
+        teacher_adapter_name=teacher_adapter_name,
+        base_teacher=args.base_teacher and teacher_adapter_name is None,
+        token_id_to_weight=token_id_to_weight,
+    )
+
+    resume_from_checkpoint = resolve_resume_from_checkpoint(
+        args.resume_from_checkpoint,
+        args.output_dir,
+    )
+    trainer.train(resume_from_checkpoint=resume_from_checkpoint)
+
+    adapter_dir = os.path.join(args.output_dir, "lora_adapter")
+    thinker.save_pretrained(adapter_dir)
+    processor.save_pretrained(adapter_dir)
+    print(f"Model saved to {adapter_dir}")
+
+
+if __name__ == "__main__":
+    main()

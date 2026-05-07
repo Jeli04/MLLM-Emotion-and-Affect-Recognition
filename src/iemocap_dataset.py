@@ -781,7 +781,11 @@ def iemocap_train_subset_sample_weights(
 
 
 class CorruptedIEMOCAPDataset(Dataset):
-    """IEMOCAP dataset with optional corruption applied to raw modality data."""
+    """IEMOCAP dataset with optional corruption applied to raw modality data.
+
+    When `distill=True`, __getitem__ returns a paired {"full": ..., "mask": ...}
+    dict unless `include_full_branch=False`, matching CorruptedMELDDataset.
+    """
 
     def __init__(
         self,
@@ -816,6 +820,11 @@ class CorruptedIEMOCAPDataset(Dataset):
         video_jpeg_quality=None,
         for_training=False,
         predict_corruption=False,
+        distill=False,
+        modality_mask=True,
+        clean_teacher=False,
+        teacher_logits_dir=None,
+        include_full_branch=True,
         drop_no_agreement=True,
         max_samples=None,
     ):
@@ -864,6 +873,11 @@ class CorruptedIEMOCAPDataset(Dataset):
         self.video_noise_level = corruption_config["video_noise_level"]
         self.for_training = for_training
         self.predict_corruption = predict_corruption
+        self.distill = distill
+        self.modality_mask = modality_mask
+        self.clean_teacher = clean_teacher
+        self.teacher_logits_dir = teacher_logits_dir
+        self.include_full_branch = include_full_branch
 
     def __len__(self):
         return len(self.raw_dataset)
@@ -871,20 +885,18 @@ class CorruptedIEMOCAPDataset(Dataset):
     def _load_video_frames(self, video_path, fps):
         return load_video_frames(video_path, fps=fps)
 
-    def __getitem__(self, idx):
-        sample = self.raw_dataset[idx]
+    def _load_audio_waveform(self, sample):
+        audio_path = sample.get("audio_path") or ""
+        if audio_path and Path(audio_path).is_file():
+            waveform, sr = librosa.load(audio_path, sr=self.audio_sr, mono=True)
+            return waveform.astype(np.float32), sr
+        return load_audio_from_video(sample["video_path"], target_sr=self.audio_sr)
 
-        text = sample["text"]
-        if self.corrupt and "text" in self.modalities:
-            text = corrupt_text(
-                text,
-                char_swap_prob=self.text_char_swap_prob,
-                word_drop_prob=self.text_word_drop_prob,
-            )
-
+    def _process(self, sample, text, frames, waveform, modalities):
+        """Render chat + run processor for one modality configuration."""
         messages = build_messages(
             {**sample, "text": text},
-            self.modalities,
+            modalities,
             corrupt=self.corrupt,
             predict_corruption=self.predict_corruption,
         )
@@ -903,37 +915,10 @@ class CorruptedIEMOCAPDataset(Dataset):
             )
             prompt_rendered = None
 
-        videos = None
-        audio = None
-        has_video = "video" in self.modalities
-        # Keep video-only runs visual-only unless audio is explicitly requested.
-        has_audio = "audio" in self.modalities
-
-        if has_video:
-            try:
-                frames = self._load_video_frames(sample["video_path"], self.fps)
-            except Exception:
-                # 2 black frames (minimum for temporal_patch_size=2), 224×224 RGB
-                frames = np.zeros((2, 224, 224, 3), dtype=np.uint8)
-            if self.corrupt:
-                frames = apply_video_corruptions(frames, self.corruption_config)
-            videos = [frames]
-
-        if has_audio:
-            try:
-                audio_path = sample.get("audio_path") or ""
-                if audio_path and Path(audio_path).is_file():
-                    waveform, sr = librosa.load(audio_path, sr=self.audio_sr, mono=True)
-                    waveform = waveform.astype(np.float32)
-                else:
-                    waveform, sr = load_audio_from_video(sample["video_path"], target_sr=self.audio_sr)
-            except Exception:
-                # 1 second of silence at the target sample rate
-                waveform = np.zeros(self.audio_sr, dtype=np.float32)
-                sr = self.audio_sr
-            if self.corrupt:
-                waveform = apply_audio_corruptions(waveform, sr, self.corruption_config)
-            audio = [waveform]
+        has_video = "video" in modalities
+        has_audio = "audio" in modalities
+        videos = [frames] if (has_video and frames is not None) else None
+        audio = [waveform] if (has_audio and waveform is not None) else None
 
         processor_kwargs = dict(
             videos=videos,
@@ -956,16 +941,103 @@ class CorruptedIEMOCAPDataset(Dataset):
             k: (v.squeeze(0) if isinstance(v, torch.Tensor) and k in batch_dim_keys else v)
             for k, v in inputs.items()
         }
-        result["emotion"] = sample["emotion"]
-        result["label"] = sample["label"]
         if prompt_len is not None:
             result["prompt_len"] = prompt_len
         return result
 
+    def _sample_kept_modalities(self):
+        mods = list(self.modalities)
+        if len(mods) <= 1:
+            return mods
+        keep_count = random.randint(1, len(mods) - 1)
+        kept = set(random.sample(mods, keep_count))
+        return [m for m in mods if m in kept]
 
-def collate_fn(batch, pad_token_id, padding_side="left", label_pad_id=-100):
-    """Collate per-sample dicts from CorruptedIEMOCAPDataset into a padded batch."""
+    def _corrupt_media(self, text, frames, waveform):
+        if "text" in self.modalities:
+            text = corrupt_text(
+                text,
+                char_swap_prob=self.text_char_swap_prob,
+                word_drop_prob=self.text_word_drop_prob,
+            )
+        if frames is not None:
+            frames = apply_video_corruptions(frames, self.corruption_config)
+        if waveform is not None:
+            waveform = apply_audio_corruptions(
+                waveform,
+                sample_rate=self.audio_sr,
+                config=self.corruption_config,
+            )
+        return text, frames, waveform
 
+    def __getitem__(self, idx):
+        sample = self.raw_dataset[idx]
+
+        text = sample["text"]
+        frames = None
+        waveform = None
+        if "video" in self.modalities:
+            try:
+                frames = self._load_video_frames(sample["video_path"], self.fps)
+            except Exception:
+                # 2 black frames (minimum for temporal_patch_size=2), 224x224 RGB
+                frames = np.zeros((2, 224, 224, 3), dtype=np.uint8)
+        if "audio" in self.modalities:
+            try:
+                waveform, _ = self._load_audio_waveform(sample)
+            except Exception:
+                waveform = np.zeros(self.audio_sr, dtype=np.float32)
+
+        if self.distill:
+            full_text, full_frames, full_waveform = text, frames, waveform
+            mask_text, mask_frames, mask_waveform = text, frames, waveform
+            if self.corrupt:
+                if self.clean_teacher:
+                    mask_text, mask_frames, mask_waveform = self._corrupt_media(
+                        text, frames, waveform,
+                    )
+                else:
+                    full_text, full_frames, full_waveform = self._corrupt_media(
+                        text, frames, waveform,
+                    )
+                    mask_text, mask_frames, mask_waveform = (
+                        full_text, full_frames, full_waveform,
+                    )
+
+            kept = self._sample_kept_modalities() if self.modality_mask else self.modalities
+            mask_item = self._process(sample, mask_text, mask_frames, mask_waveform, kept)
+            mask_item["emotion"] = sample["emotion"]
+            mask_item["label"] = sample["label"]
+
+            result = {
+                "mask": mask_item,
+                "emotion": sample["emotion"],
+                "label": sample["label"],
+            }
+            if self.include_full_branch:
+                full_item = self._process(
+                    sample, full_text, full_frames, full_waveform, self.modalities,
+                )
+                full_item["emotion"] = sample["emotion"]
+                full_item["label"] = sample["label"]
+                result["full"] = full_item
+            if self.teacher_logits_dir is not None:
+                cache_path = Path(self.teacher_logits_dir) / f"sample_{idx:06d}.pt"
+                cached = torch.load(cache_path, map_location="cpu", weights_only=True)
+                result["teacher_response_logits"] = cached["response_logits"]
+                result["teacher_response_labels"] = cached["response_labels"]
+            return result
+
+        if self.corrupt:
+            text, frames, waveform = self._corrupt_media(text, frames, waveform)
+        result = self._process(sample, text, frames, waveform, self.modalities)
+        result["emotion"] = sample["emotion"]
+        result["label"] = sample["label"]
+        return result
+
+
+def _collate_single(batch, pad_token_id, padding_side, label_pad_id):
+    """Collate a flat list of per-sample dicts (no 'full'/'mask' nesting)."""
     def pad_1d(seqs, pad_value):
         max_len = max(s.size(0) for s in seqs)
         out = []
@@ -993,21 +1065,23 @@ def collate_fn(batch, pad_token_id, padding_side="left", label_pad_id=-100):
         "attention_mask": pad_1d([b["attention_mask"] for b in batch], 0),
     }
 
-    if "pixel_values_videos" in batch[0]:
-        out["pixel_values_videos"] = torch.cat([b["pixel_values_videos"] for b in batch], dim=0)
-        out["video_grid_thw"] = torch.cat([b["video_grid_thw"] for b in batch], dim=0)
-        if "video_second_per_grid" in batch[0]:
-            vals = [b["video_second_per_grid"] for b in batch]
+    video_samples = [b for b in batch if "pixel_values_videos" in b]
+    if video_samples:
+        out["pixel_values_videos"] = torch.cat([b["pixel_values_videos"] for b in video_samples], dim=0)
+        out["video_grid_thw"] = torch.cat([b["video_grid_thw"] for b in video_samples], dim=0)
+        if "video_second_per_grid" in video_samples[0]:
+            vals = [b["video_second_per_grid"] for b in video_samples]
             if isinstance(vals[0], torch.Tensor):
                 out["video_second_per_grid"] = torch.cat(vals, dim=0)
             else:
                 out["video_second_per_grid"] = [v for sub in vals for v in sub]
 
-    if "input_features" in batch[0]:
-        out["input_features"] = pad_last([b["input_features"] for b in batch], 0.0)
-        if "feature_attention_mask" in batch[0]:
+    audio_samples = [b for b in batch if "input_features" in b]
+    if audio_samples:
+        out["input_features"] = pad_last([b["input_features"] for b in audio_samples], 0.0)
+        if "feature_attention_mask" in audio_samples[0]:
             out["feature_attention_mask"] = pad_last(
-                [b["feature_attention_mask"] for b in batch], 0,
+                [b["feature_attention_mask"] for b in audio_samples], 0,
             )
 
     if "prompt_len" in batch[0]:
@@ -1025,6 +1099,28 @@ def collate_fn(batch, pad_token_id, padding_side="left", label_pad_id=-100):
         out["labels"] = labels
 
     return out
+
+
+def collate_fn(batch, pad_token_id, padding_side="left", label_pad_id=-100):
+    """Collate per-sample dicts from CorruptedIEMOCAPDataset into a padded batch."""
+    if "full" in batch[0] or "mask" in batch[0]:
+        mask = _collate_single([b["mask"] for b in batch], pad_token_id, padding_side, label_pad_id)
+        out = {"mask": mask}
+        if "full" in batch[0]:
+            out["full"] = _collate_single(
+                [b["full"] for b in batch],
+                pad_token_id,
+                padding_side,
+                label_pad_id,
+            )
+        if "labels" in mask:
+            out["labels"] = mask["labels"]
+        if "teacher_response_logits" in batch[0]:
+            out["teacher_response_logits"] = [b["teacher_response_logits"] for b in batch]
+            out["teacher_response_labels"] = [b["teacher_response_labels"] for b in batch]
+        return out
+
+    return _collate_single(batch, pad_token_id, padding_side, label_pad_id)
 
 
 # Backward compatibility with prior name used in this repo.

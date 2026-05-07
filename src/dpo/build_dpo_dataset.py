@@ -5,6 +5,7 @@ import math
 import os
 import random
 import warnings
+from collections import Counter
 from functools import partial
 
 warnings.filterwarnings("ignore")
@@ -41,28 +42,33 @@ from src.iemocap_dataset import (
     SYSTEM_PROMPT as IEMOCAP_SYSTEM_PROMPT,
 )
 
+# Mapping pred -> plausible ground-truth labels. Used to keep DPO pairs where
+# the model's wrong prediction is in a known confusion direction. Edges include
+# both "natural" emotional confusions and observed over-prediction directions
+# (e.g. anger/surprise/joy frequently produced when the gold is neutral), so
+# DPO can correct the SFT's most common false positives.
 MELD_CONFUSION_PAIRS = {
-    "neutral": ["sadness", "joy"],
-    "sadness": ["neutral", "fear"],
-    "joy": ["neutral", "surprise"],
-    "anger": ["disgust"],
-    "disgust": ["anger"],
-    "surprise": ["joy", "fear"],
-    "fear": ["surprise", "sadness"],
+    "neutral":  ["sadness", "joy", "anger", "surprise"],
+    "sadness":  ["neutral", "fear", "anger"],
+    "joy":      ["neutral", "surprise", "anger"],
+    "anger":    ["disgust", "neutral", "joy", "sadness"],
+    "disgust":  ["anger", "neutral", "sadness"],
+    "surprise": ["joy", "fear", "neutral"],
+    "fear":     ["surprise", "sadness", "neutral"],
 }
 
 # Plausible confusions for IEMOCAP 10-class labels (same semantics as MELD graph where applicable).
 IEMOCAP_CONFUSION_PAIRS = {
-    "neutral": ["sad", "happy", "frustrated"],
-    "sad": ["neutral", "fearful", "frustrated"],
-    "happy": ["neutral", "excited", "surprised"],
-    "angry": ["disgusted", "frustrated", "neutral"],
-    "disgusted": ["angry", "frustrated"],
-    "fearful": ["surprised", "sad", "neutral"],
-    "surprised": ["happy", "fearful", "excited"],
-    "frustrated": ["angry", "neutral", "sad"],
-    "excited": ["happy", "surprised"],
-    "other": ["neutral", "happy", "sad"],
+    "neutral":    ["sad", "happy", "frustrated", "angry", "excited"],
+    "sad":        ["neutral", "fearful", "frustrated", "angry"],
+    "happy":      ["neutral", "excited", "surprised", "frustrated"],
+    "angry":      ["disgusted", "frustrated", "neutral", "sad"],
+    "disgusted":  ["angry", "frustrated", "neutral"],
+    "fearful":    ["surprised", "sad", "neutral"],
+    "surprised":  ["happy", "fearful", "excited", "neutral"],
+    "frustrated": ["angry", "neutral", "sad", "disgusted"],
+    "excited":    ["happy", "surprised", "neutral"],
+    "other":      ["neutral", "happy", "sad"],
 }
 
 
@@ -126,13 +132,29 @@ def parse_args():
     parser.add_argument("--no_corrupt", dest="corrupt", action="store_false",
                         help="Disable input corruption")
     parser.add_argument("--corruption_preset", default="medium",
-                        help="Corruption preset when --corrupt is enabled (mild|medium|strong)")
+                        help="Corruption preset to use when --corrupt is enabled")
     parser.add_argument("--output_dir", default=os.path.join("results", "dpo"),
                         help="Directory where evaluation and DPO files are saved")
-    parser.add_argument("--correct_sample_ratio", type=float, default=0.15,
-                        help="Target fraction of final DPO samples drawn from correct model predictions")
+    parser.add_argument(
+        "--output_name_suffix",
+        default=None,
+        help="Optional suffix to append to output filenames, e.g. student_teacher",
+    )
+    parser.add_argument("--correct_sample_ratio", type=float, default=0.0,
+                        help="Target fraction of final DPO samples drawn from correct model predictions. "
+                             "Correct predictions are eligible only when the highest-scoring "
+                             "non-ground-truth emotion is a known confusion-pair partner. "
+                             "Use 0 to disable correct-prediction samples.")
     parser.add_argument("--correct_sample_seed", type=int, default=42,
                         help="Random seed for selecting correct-prediction DPO samples")
+    parser.add_argument("--max_chosen_per_class", type=int, default=None,
+                        help="Optional cap on the number of DPO pairs per `chosen` label. "
+                             "Applied after confusion-pair and correct-prediction selection. "
+                             "Use to prevent majority `chosen` (e.g. neutral, joy) from "
+                             "dominating the preference signal. None disables the cap.")
+    parser.add_argument("--max_chosen_per_class_seed", type=int, default=42,
+                        help="Random seed used when subsampling pairs to enforce "
+                             "--max_chosen_per_class")
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed for model evaluation and input corruption")
     args = parser.parse_args()
@@ -187,6 +209,7 @@ def build_dpo_sample(
     dataset: str,
     rejected_emotion=None,
     selection_reason="confusion_pair_error",
+    emotion_score_info=None,
 ):
     """Create a preference record for DPO: ground truth is chosen, confused prediction is rejected."""
     prompt_messages = build_prompt_messages(
@@ -202,7 +225,7 @@ def build_dpo_sample(
         "content": [{"type": "text", "text": rejected_emotion}],
     }
 
-    row = {
+    result = {
         "sample_index": sample_index,
         "dialogue_id": raw_sample["dialogue_id"],
         "utterance_id": raw_sample["utterance_id"],
@@ -228,10 +251,13 @@ def build_dpo_sample(
         "chosen_messages": prompt_messages + [chosen_message],
         "rejected_messages": prompt_messages + [rejected_message],
     }
+    if emotion_score_info is not None:
+        result["emotion_score_info"] = emotion_score_info
+
     if dataset == "iemocap":
-        row["audio_path"] = raw_sample.get("audio_path") or ""
-        row["session"] = raw_sample.get("session", "")
-    return row
+        result["audio_path"] = raw_sample.get("audio_path") or ""
+        result["session"] = raw_sample.get("session", "")
+    return result
 
 
 def is_confusion_pair(pred, gt_emotion, confusion_pairs):
@@ -248,6 +274,36 @@ def get_rejected_emotion_for_correct_sample(gt_emotion, rng, confusion_pairs):
     return rng.choice(alts)
 
 
+def cap_samples_per_chosen(samples, max_per_class, seed):
+    """Downsample DPO pairs so no `chosen` label exceeds ``max_per_class``.
+
+    Returns ``(kept, dropped_per_class)`` where ``dropped_per_class`` maps the
+    `chosen` label to the number of pairs dropped for that label. When
+    ``max_per_class`` is ``None`` or no class exceeds the cap, samples are
+    returned unchanged.
+    """
+    if max_per_class is None or max_per_class <= 0:
+        return list(samples), {}
+
+    by_chosen = {}
+    for idx, sample in enumerate(samples):
+        by_chosen.setdefault(sample["chosen"], []).append(idx)
+
+    rng = random.Random(seed)
+    keep_indices = set()
+    dropped = {}
+    for chosen, indices in by_chosen.items():
+        if len(indices) <= max_per_class:
+            keep_indices.update(indices)
+            continue
+        kept = rng.sample(indices, max_per_class)
+        keep_indices.update(kept)
+        dropped[chosen] = len(indices) - max_per_class
+
+    kept_samples = [s for i, s in enumerate(samples) if i in keep_indices]
+    return kept_samples, dropped
+
+
 def sample_correct_predictions(correct_candidates, confusion_sample_count, target_ratio, rng):
     if target_ratio <= 0 or not correct_candidates:
         return []
@@ -262,6 +318,75 @@ def sample_correct_predictions(correct_candidates, confusion_sample_count, targe
         return []
 
     return rng.sample(correct_candidates, target_correct_count)
+
+
+def score_candidate_emotions(model, tokenizer, inputs, candidate_emotions):
+    """Score every emotion as the assistant response for the current prompt.
+
+    The DPO builder uses generation for the argmax prediction, but correct
+    predictions need a runner-up label. This helper teacher-forces each valid
+    emotion after the exact processed prompt and records length-normalized
+    response logprobs, avoiding randomly invented rejected labels.
+    """
+    prompt_ids = inputs["input_ids"]
+    prompt_attention = inputs["attention_mask"]
+    prompt_len = prompt_ids.shape[-1]
+    scores = {}
+    token_logprobs = {}
+
+    for emotion in candidate_emotions:
+        response_ids = tokenizer(
+            emotion,
+            add_special_tokens=False,
+            return_tensors="pt",
+        ).input_ids.to(prompt_ids.device)
+        if response_ids.numel() == 0:
+            continue
+
+        full_inputs = {
+            k: v
+            for k, v in inputs.items()
+            if k not in ("input_ids", "attention_mask")
+        }
+        full_inputs["input_ids"] = torch.cat([prompt_ids, response_ids], dim=-1)
+        full_inputs["attention_mask"] = torch.cat(
+            [
+                prompt_attention,
+                prompt_attention.new_ones(response_ids.shape),
+            ],
+            dim=-1,
+        )
+
+        outputs = model.thinker(**full_inputs)
+        logits = outputs.logits if hasattr(outputs, "logits") else outputs[0]
+
+        emotion_token_logprobs = []
+        for offset, token_id in enumerate(response_ids[0]):
+            logit_index = prompt_len + offset - 1
+            next_token_logprobs = logits[0, logit_index].float().log_softmax(dim=-1)
+            emotion_token_logprobs.append(float(next_token_logprobs[token_id].item()))
+
+        mean_logprob = sum(emotion_token_logprobs) / len(emotion_token_logprobs)
+        scores[emotion] = mean_logprob
+        token_logprobs[emotion] = emotion_token_logprobs
+
+    ranking = sorted(scores, key=scores.get, reverse=True)
+    return {
+        "emotion_mean_logprobs": scores,
+        "emotion_token_logprobs": token_logprobs,
+        "emotion_ranking": ranking,
+    }
+
+
+def add_runner_up_info(score_info, gt_emotion, confusion_pairs):
+    ranking = score_info["emotion_ranking"]
+    runner_up = next((emotion for emotion in ranking if emotion != gt_emotion), None)
+    score_info["top_emotion"] = ranking[0] if ranking else None
+    score_info["runner_up_emotion"] = runner_up
+    score_info["runner_up_is_confusion_pair"] = (
+        runner_up in confusion_pairs.get(gt_emotion, [])
+    )
+    return score_info
 
 
 def make_eval_collate(collate_fn_impl, pad_token_id):
@@ -387,8 +512,8 @@ def main():
     per_sample_results = []
 
     # DPO samples are examples where the model prediction is a known confusing
-    # emotion for the ground-truth label. A small sampled slice of correct
-    # predictions is added below with a plausible confusing emotion as rejected.
+    # emotion for the ground-truth label. Correct predictions are considered
+    # only if their forced-choice runner-up emotion is a confusion-pair partner.
     dpo_sample_indices = []
     dpo_samples = []
     correct_dpo_candidates = []
@@ -447,7 +572,7 @@ def main():
         raw_output = output_text[0].strip()
         is_valid = pred in valid_emotions
 
-        row_meta = {
+        sample_result = {
             "sample_index": raw_idx,
             "dialogue_id": raw_sample["dialogue_id"],
             "utterance_id": raw_sample["utterance_id"],
@@ -458,9 +583,10 @@ def main():
             "valid": is_valid,
             "skipped": False,
         }
+
         if args.dataset == "iemocap":
-            row_meta["session"] = raw_sample.get("session", "")
-        per_sample_results.append(row_meta)
+            sample_result["session"] = raw_sample.get("session", "")
+        per_sample_results.append(sample_result)
 
         if not is_valid:
             invalid_predictions.append((raw_idx, raw_output, gt_emotion))
@@ -484,27 +610,44 @@ def main():
                         dataset=args.dataset,
                     )
                 )
-            elif pred == gt_emotion:
-                correct_dpo_candidates.append(
-                    build_dpo_sample(
-                        sample_index=raw_idx,
-                        raw_sample=raw_sample,
-                        gt_emotion=gt_emotion,
-                        pred=pred,
-                        raw_output=raw_output,
-                        modalities=args.modalities,
-                        corrupt=args.corrupt,
-                        corruption_preset=args.corruption_preset,
-                        system_prompt=system_prompt,
-                        dataset=args.dataset,
-                        rejected_emotion=get_rejected_emotion_for_correct_sample(
-                            gt_emotion,
-                            correct_sample_rng,
-                            confusion_pairs,
-                        ),
-                        selection_reason="correct_prediction",
+            elif pred == gt_emotion and args.correct_sample_ratio > 0:
+                try:
+                    with torch.no_grad():
+                        score_info = score_candidate_emotions(
+                            model,
+                            processor.tokenizer,
+                            inputs,
+                            sorted(valid_emotions),
+                        )
+                    score_info = add_runner_up_info(score_info, gt_emotion, confusion_pairs)
+                    sample_result["emotion_score_info"] = score_info
+                except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
+                    sample_result["emotion_score_error"] = str(e)
+                    torch.cuda.empty_cache()
+                    tqdm.write(
+                        f"  Could not score correct sample {i}: {str(e)[:100]}"
                     )
-                )
+                    continue
+
+                runner_up = score_info["runner_up_emotion"]
+                if score_info["runner_up_is_confusion_pair"]:
+                    correct_dpo_candidates.append(
+                        build_dpo_sample(
+                            sample_index=raw_idx,
+                            raw_sample=raw_sample,
+                            gt_emotion=gt_emotion,
+                            pred=pred,
+                            raw_output=raw_output,
+                            modalities=args.modalities,
+                            corrupt=args.corrupt,
+                            corruption_preset=args.corruption_preset,
+                            system_prompt=system_prompt,
+                            dataset=args.dataset,
+                            rejected_emotion=runner_up,
+                            selection_reason="correct_prediction_runner_up_confusion_pair",
+                            emotion_score_info=score_info,
+                        )
+                    )
 
     confusion_pair_sample_count = len(dpo_samples)
     correct_dpo_samples = sample_correct_predictions(
@@ -515,6 +658,15 @@ def main():
     )
     dpo_samples.extend(correct_dpo_samples)
     dpo_sample_indices.extend(sample["sample_index"] for sample in correct_dpo_samples)
+
+    pre_cap_count = len(dpo_samples)
+    pre_cap_chosen_counts = dict(Counter(s["chosen"] for s in dpo_samples))
+    dpo_samples, dropped_per_class = cap_samples_per_chosen(
+        dpo_samples,
+        args.max_chosen_per_class,
+        args.max_chosen_per_class_seed,
+    )
+    dpo_sample_indices = [s["sample_index"] for s in dpo_samples]
 
     # --- Report metrics ---
     print("\n" + "=" * 60)
@@ -529,8 +681,18 @@ def main():
     print(f"Invalid predictions: {len(invalid_predictions)}")
     print(f"Skipped (OOM/error): {len(skipped_samples)}")
     print(f"DPO confusion-pair samples: {confusion_pair_sample_count}")
-    print(f"DPO correct-prediction samples: {len(correct_dpo_samples)}")
-    print(f"DPO total samples: {len(dpo_samples)}")
+    print(f"DPO eligible correct-prediction candidates: {len(correct_dpo_candidates)}")
+    print(f"DPO sampled correct-prediction samples: {len(correct_dpo_samples)}")
+    print(f"DPO total samples (pre-cap): {pre_cap_count}")
+    print(f"DPO chosen distribution (pre-cap): {pre_cap_chosen_counts}")
+    if args.max_chosen_per_class is not None:
+        print(
+            f"DPO --max_chosen_per_class={args.max_chosen_per_class} "
+            f"(seed={args.max_chosen_per_class_seed}); dropped per class: {dropped_per_class}"
+        )
+    post_cap_chosen_counts = dict(Counter(s["chosen"] for s in dpo_samples))
+    print(f"DPO total samples (post-cap): {len(dpo_samples)}")
+    print(f"DPO chosen distribution (post-cap): {post_cap_chosen_counts}")
 
     if invalid_predictions:
         print(f"\n--- Invalid Predictions ({len(invalid_predictions)}) ---")
@@ -558,7 +720,10 @@ def main():
 
     modalities_str = "+".join(sorted(args.modalities))
     corrupt_str = f"corrupt_{args.corruption_preset}" if args.corrupt else "clean"
-    model_str = "finetuned" if args.adapter_path else "base"
+    if args.output_name_suffix:
+        model_str = args.output_name_suffix.strip().replace(" ", "_")
+    else:
+        model_str = "finetuned" if args.adapter_path else "base"
     # Keep MELD output filenames unchanged; prefix IEMOCAP runs for clarity.
     ds_prefix = f"{args.dataset}_" if args.dataset == "iemocap" else ""
     output_filename = f"results_{ds_prefix}{split_label}_{modalities_str}_{corrupt_str}_{model_str}.json"
@@ -593,11 +758,19 @@ def main():
         "confusion_pairs": confusion_pairs,
         "dpo_sample_count": len(dpo_samples),
         "dpo_confusion_pair_sample_count": confusion_pair_sample_count,
+        "dpo_correct_prediction_eligible_candidate_count": len(correct_dpo_candidates),
         "dpo_correct_prediction_sample_count": len(correct_dpo_samples),
         "dpo_correct_prediction_target_ratio": args.correct_sample_ratio,
         "dpo_correct_prediction_actual_ratio": (
             len(correct_dpo_samples) / len(dpo_samples) if dpo_samples else 0.0
         ),
+        "dpo_correct_prediction_selection": "runner_up_confusion_pair",
+        "dpo_max_chosen_per_class": args.max_chosen_per_class,
+        "dpo_max_chosen_per_class_seed": args.max_chosen_per_class_seed,
+        "dpo_pre_cap_sample_count": pre_cap_count,
+        "dpo_pre_cap_chosen_counts": pre_cap_chosen_counts,
+        "dpo_post_cap_chosen_counts": post_cap_chosen_counts,
+        "dpo_dropped_per_class": dropped_per_class,
         "dpo_sample_indices": dpo_sample_indices,
         "predictions": per_sample_results,
     }
@@ -625,12 +798,20 @@ def main():
         "confusion_pairs": confusion_pairs,
         "sample_count": len(dpo_samples),
         "confusion_pair_sample_count": confusion_pair_sample_count,
+        "correct_prediction_eligible_candidate_count": len(correct_dpo_candidates),
         "correct_prediction_sample_count": len(correct_dpo_samples),
         "correct_prediction_target_ratio": args.correct_sample_ratio,
         "correct_prediction_actual_ratio": (
             len(correct_dpo_samples) / len(dpo_samples) if dpo_samples else 0.0
         ),
+        "correct_prediction_selection": "runner_up_confusion_pair",
         "correct_prediction_seed": args.correct_sample_seed,
+        "max_chosen_per_class": args.max_chosen_per_class,
+        "max_chosen_per_class_seed": args.max_chosen_per_class_seed,
+        "pre_cap_sample_count": pre_cap_count,
+        "pre_cap_chosen_counts": pre_cap_chosen_counts,
+        "post_cap_chosen_counts": post_cap_chosen_counts,
+        "dropped_per_class": dropped_per_class,
         "sample_indices": dpo_sample_indices,
         "samples": dpo_samples,
     }

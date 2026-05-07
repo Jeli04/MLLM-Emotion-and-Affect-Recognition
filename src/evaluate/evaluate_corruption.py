@@ -30,18 +30,32 @@ import optimum.gptq.constants
 optimum.gptq.constants.BLOCK_PATTERNS.insert(0, "thinker.model.layers")
 
 from src.meld_dataset import (
-    CORRUPTION_PRESET_NAMES,
+    CORRUPTION_PRESET_NAMES as MELD_CORRUPTION_PRESET_NAMES,
     CorruptedMELDDataset,
     collate_fn,
-    EMOTION2ID,
+    EMOTION2ID as MELD_EMOTION2ID,
+)
+from src.iemocap_dataset import (
+    CORRUPTION_PRESET_NAMES as IEMOCAP_CORRUPTION_PRESET_NAMES,
+    CorruptedIEMOCAPDataset,
+    collate_fn as iemocap_collate_fn,
+    compute_iemocap_train_val_holdout_split,
+    EMOTION2ID as IEMOCAP_EMOTION2ID,
 )
 
-ID2EMOTION = {v: k for k, v in EMOTION2ID.items()}
-VALID_EMOTIONS = set(EMOTION2ID.keys())
+MELD_VALID_EMOTIONS = set(MELD_EMOTION2ID.keys())
+IEMOCAP_VALID_EMOTIONS = set(IEMOCAP_EMOTION2ID.keys())
+CORRUPTION_PRESET_NAMES = tuple(
+    sorted(set(MELD_CORRUPTION_PRESET_NAMES) | set(IEMOCAP_CORRUPTION_PRESET_NAMES))
+)
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Evaluate Qwen2.5-Omni on MELD emotion recognition")
+    parser = argparse.ArgumentParser(
+        description="Evaluate Qwen2.5-Omni on MELD/IEMOCAP emotion recognition with corruption"
+    )
+    parser.add_argument("--dataset", default="meld", choices=["meld", "iemocap"],
+                        help="Dataset backend (default: meld)")
     parser.add_argument("--modalities", nargs="+", default=["text"],
                         choices=["text", "audio", "video"],
                         help="Which modalities to include in the input (default: text)")
@@ -49,6 +63,22 @@ def parse_args():
                         help="Dataset split to evaluate on (default: test)")
     parser.add_argument("--data_root", default="/project2/robinjia_875/lijc/data/MELD.Raw",
                         help="Path to MELD.Raw directory")
+    parser.add_argument("--manifest", default=None,
+                        help="Path to IEMOCAP utterance manifest CSV (required for --dataset iemocap)")
+    parser.add_argument("--iemocap_sessions", nargs="+", default=None,
+                        help="Optional IEMOCAP session filter, e.g. Session1 Session2")
+    parser.add_argument("--iemocap_manifest_split", default=None,
+                        help="If the IEMOCAP manifest has a split column, keep only rows matching this value")
+    parser.add_argument("--iemocap_holdout_n", type=int, default=500,
+                        help="Random eval holdout size for IEMOCAP test split; 0 disables")
+    parser.add_argument("--iemocap_holdout_seed", type=int, default=42,
+                        help="RNG seed for the IEMOCAP holdout subset")
+    parser.add_argument("--iemocap_val_ratio", type=float, default=0.1,
+                        help="Fraction of non-holdout IEMOCAP samples used for dev split")
+    parser.add_argument("--iemocap_split_seed", type=int, default=43,
+                        help="RNG seed for shuffling non-holdout IEMOCAP rows before train/dev split")
+    parser.add_argument("--max_samples", type=int, default=None,
+                        help="Optional cap on IEMOCAP rows before train/dev/test indexing")
     parser.add_argument("--model_path", default="./ckpts/Qwen2.5-Omni-7B-GPTQ-Int4",
                         help="Path to the model")
     parser.add_argument("--adapter_path", default=None,
@@ -63,8 +93,9 @@ def parse_args():
     parser.add_argument("--corruption_preset", default="medium",
                         choices=CORRUPTION_PRESET_NAMES,
                         help="Corruption preset to use when corruption is enabled")
-    parser.add_argument("--output_dir", default=os.path.join("results", "meld"),
-                        help="Directory where MELD corruption results are saved")
+    parser.add_argument("--output_dir", default=None,
+                        help="Directory where corruption results are saved. "
+                             "Defaults to results/meld or results/iemocap.")
     parser.add_argument("--data_subset_percent", type=float, default=100.0,
                         help="Percentage of the split to evaluate, sampled deterministically "
                              "with --seed (default: 100)")
@@ -73,6 +104,21 @@ def parse_args():
     args = parser.parse_args()
     if not 0 < args.data_subset_percent <= 100:
         parser.error("--data_subset_percent must be greater than 0 and at most 100")
+    preset_names = (
+        IEMOCAP_CORRUPTION_PRESET_NAMES
+        if args.dataset == "iemocap"
+        else MELD_CORRUPTION_PRESET_NAMES
+    )
+    if args.corruption_preset not in preset_names:
+        parser.error(
+            f"--corruption_preset must be one of {preset_names}, "
+            f"got {args.corruption_preset!r}"
+        )
+    if args.dataset == "iemocap":
+        if not args.manifest:
+            parser.error("--manifest is required when --dataset iemocap")
+        if not 0.0 <= args.iemocap_val_ratio < 1.0:
+            parser.error("--iemocap_val_ratio must be in [0, 1)")
     return args
 
 
@@ -88,53 +134,109 @@ def build_eval_indices(total_samples, subset_percent, seed):
     return sorted(rng.sample(range(total_samples), subset_size))
 
 
-def eval_collate(batch, pad_token_id):
+def eval_collate(batch, pad_token_id, collate_fn_impl):
     """Collate wrapper that extracts non-tensor metadata before calling collate_fn."""
     emotions = [b["emotion"] for b in batch]
     tensor_batch = [{k: v for k, v in b.items() if k not in ("emotion", "label")} for b in batch]
-    collated = collate_fn(tensor_batch, pad_token_id=pad_token_id, padding_side="left")
+    collated = collate_fn_impl(tensor_batch, pad_token_id=pad_token_id, padding_side="left")
     collated["emotions"] = emotions
     return collated
+
+
+def build_iemocap_eval_indices(args):
+    train_idx, val_idx, holdout_idx = compute_iemocap_train_val_holdout_split(
+        args.manifest,
+        holdout_n=args.iemocap_holdout_n,
+        holdout_seed=args.iemocap_holdout_seed,
+        val_ratio=args.iemocap_val_ratio,
+        split_seed=args.iemocap_split_seed,
+        sessions=args.iemocap_sessions,
+        split=args.iemocap_manifest_split,
+    )
+    if args.split == "train":
+        return train_idx
+    if args.split == "dev":
+        return val_idx
+    return holdout_idx
+
+
+def get_cuda_eval_device():
+    if not torch.cuda.is_available():
+        raise RuntimeError(
+            "CUDA is not available, but the GPTQ eval model must run on GPU. "
+            "Check the Slurm GPU allocation/CUDA_VISIBLE_DEVICES for this job."
+        )
+    return f"cuda:{torch.cuda.current_device()}"
 
 
 def main():
     args = parse_args()
     set_seed(args.seed)
+    eval_device = get_cuda_eval_device()
     print(
-        f"Evaluating on split='{args.split}' with modalities={args.modalities}, "
+        f"Evaluating dataset='{args.dataset}' on split='{args.split}' with modalities={args.modalities}, "
         f"corrupt={args.corrupt}, corruption_preset={args.corruption_preset}, "
-        f"data_subset_percent={args.data_subset_percent:g}, seed={args.seed}"
+        f"data_subset_percent={args.data_subset_percent:g}, seed={args.seed}, "
+        f"device={eval_device}"
     )
 
     processor = Qwen2_5OmniProcessor.from_pretrained(args.model_path)
     model = Qwen2_5OmniForConditionalGeneration.from_pretrained(
         args.model_path,
-        device_map="auto",
+        device_map={"": eval_device},
         enable_audio_output=False,
     )
     if args.adapter_path is not None:
         print(f"Loading LoRA adapter from {args.adapter_path}...")
-        model.thinker = PeftModel.from_pretrained(model.thinker, args.adapter_path)
+        model.thinker = PeftModel.from_pretrained(
+            model.thinker,
+            args.adapter_path,
+            torch_device=eval_device,
+        )
 
     model.eval()
 
-    first_device = next(model.parameters()).device
+    first_device = torch.device(eval_device)
 
-    dataset = CorruptedMELDDataset(
-        args.data_root,
-        processor=processor,
-        split=args.split,
-        modalities=tuple(args.modalities),
-        corrupt=args.corrupt,
-        corruption_preset=args.corruption_preset,
-        for_training=False,
-    )
+    if args.dataset == "iemocap":
+        dataset = CorruptedIEMOCAPDataset(
+            args.manifest,
+            processor=processor,
+            split=args.iemocap_manifest_split,
+            sessions=args.iemocap_sessions,
+            modalities=tuple(args.modalities),
+            corrupt=args.corrupt,
+            corruption_preset=args.corruption_preset,
+            for_training=False,
+            max_samples=args.max_samples,
+        )
+        valid_emotions = IEMOCAP_VALID_EMOTIONS
+        collate_fn_impl = iemocap_collate_fn
+        eval_indices = build_iemocap_eval_indices(args)
+        if args.max_samples is not None:
+            eval_indices = [i for i in eval_indices if i < len(dataset)]
+    else:
+        dataset = CorruptedMELDDataset(
+            args.data_root,
+            processor=processor,
+            split=args.split,
+            modalities=tuple(args.modalities),
+            corrupt=args.corrupt,
+            corruption_preset=args.corruption_preset,
+            for_training=False,
+        )
+        valid_emotions = MELD_VALID_EMOTIONS
+        collate_fn_impl = collate_fn
+        eval_indices = list(range(len(dataset)))
+
     full_dataset_samples = len(dataset)
-    eval_indices = build_eval_indices(
-        full_dataset_samples,
-        args.data_subset_percent,
-        args.seed,
-    )
+    if args.data_subset_percent < 100:
+        subset_positions = build_eval_indices(
+            len(eval_indices),
+            args.data_subset_percent,
+            args.seed,
+        )
+        eval_indices = [eval_indices[i] for i in subset_positions]
     using_subset = len(eval_indices) != full_dataset_samples
     eval_dataset = Subset(dataset, eval_indices) if using_subset else dataset
     if using_subset:
@@ -147,7 +249,11 @@ def main():
         eval_dataset,
         batch_size=1,
         shuffle=False,
-        collate_fn=partial(eval_collate, pad_token_id=processor.tokenizer.pad_token_id),
+        collate_fn=partial(
+            eval_collate,
+            pad_token_id=processor.tokenizer.pad_token_id,
+            collate_fn_impl=collate_fn_impl,
+        ),
         num_workers=0,
     )
 
@@ -208,7 +314,7 @@ def main():
 
         pred = output_text[0].strip().lower()
         raw_output = output_text[0].strip()
-        is_valid = pred in VALID_EMOTIONS
+        is_valid = pred in valid_emotions
 
         sample_result = {
             "sample_index": raw_idx,
@@ -252,7 +358,7 @@ def main():
         for idx, model_out, gt in invalid_predictions:
             print(f"  Sample {idx}: model='{model_out}' | gt='{gt}'")
 
-    label_names = sorted(VALID_EMOTIONS)
+    label_names = sorted(valid_emotions)
 
     acc = None
     macro_f1 = None
@@ -315,19 +421,29 @@ def main():
     if using_subset:
         subset_pct = f"{args.data_subset_percent:g}".replace(".", "p")
         subset_str = f"_subset{subset_pct}pct"
-    output_filename = f"results_{args.split}_{modalities_str}_{corrupt_str}_{model_str}{subset_str}.json"
-    output_path = os.path.join(args.output_dir, output_filename)
+    ds_prefix = "results_iemocap" if args.dataset == "iemocap" else "results"
+    output_filename = f"{ds_prefix}_{args.split}_{modalities_str}_{corrupt_str}_{model_str}{subset_str}.json"
+    output_dir = args.output_dir or os.path.join("results", args.dataset)
+    output_path = os.path.join(output_dir, output_filename)
 
     results_json = {
+        "dataset": args.dataset,
         "split": args.split,
         "modalities": args.modalities,
         "corrupt": args.corrupt,
         "corruption_preset": args.corruption_preset,
         "adapter_path": args.adapter_path,
+        "manifest": os.path.abspath(args.manifest) if args.manifest else None,
+        "iemocap_sessions": args.iemocap_sessions,
+        "iemocap_manifest_split": args.iemocap_manifest_split,
+        "iemocap_holdout_n": args.iemocap_holdout_n if args.dataset == "iemocap" else None,
+        "iemocap_holdout_seed": args.iemocap_holdout_seed if args.dataset == "iemocap" else None,
+        "iemocap_val_ratio": args.iemocap_val_ratio if args.dataset == "iemocap" else None,
+        "iemocap_split_seed": args.iemocap_split_seed if args.dataset == "iemocap" else None,
         "data_subset_percent": args.data_subset_percent,
         "total_samples": len(eval_dataset),
         "full_dataset_samples": full_dataset_samples,
-        "sample_indices": eval_indices if using_subset else None,
+        "sample_indices": eval_indices if (using_subset or args.dataset == "iemocap") else None,
         "valid_predictions": len(all_preds),
         "invalid_predictions": len(invalid_predictions),
         "skipped_samples": len(skipped_samples),
@@ -340,7 +456,7 @@ def main():
         "predictions": per_sample_results,
     }
 
-    os.makedirs(args.output_dir, exist_ok=True)
+    os.makedirs(output_dir, exist_ok=True)
     with open(output_path, "w") as f:
         json.dump(results_json, f, indent=2)
     print(f"\nResults saved to {output_path}")

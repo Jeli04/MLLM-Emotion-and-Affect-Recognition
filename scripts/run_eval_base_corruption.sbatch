@@ -5,7 +5,7 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=120G
-#SBATCH --gres=gpu:1
+#SBATCH --gres=gpu:rtxa6000:1
 #SBATCH --time=2-00:00:00
 #SBATCH --output=slurm_logs/%j.out
 #SBATCH --error=slurm_logs/%j.err
@@ -20,6 +20,12 @@ cd $SLURM_SUBMIT_DIR
 
 source ./.venv/bin/activate
 module load ffmpeg
+
+echo "HOSTNAME=${HOSTNAME}"
+echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-unset}"
+nvidia-smi -L || true
+python -c "import torch; print('torch_cuda_available=', torch.cuda.is_available(), 'device_count=', torch.cuda.device_count(), 'current_device=', torch.cuda.current_device() if torch.cuda.is_available() else None)"
+
 PYTHONPATH=. python -m src.evaluate.evaluate_corruption \
     --modalities text audio video \
     "$@"

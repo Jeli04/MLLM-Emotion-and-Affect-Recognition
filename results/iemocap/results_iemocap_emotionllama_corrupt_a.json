@@ -529,8 +529,8 @@
   "invalid_predictions": 2,
   "skipped_samples": 0,
   "accuracy": 0.28313253012048195,
-  "auroc_macro_ovr": NaN,
-  "auprc_macro_ovr": 0.13463343681666223,
+  "auroc_macro_ovr": 0.582174215385026,
+  "auprc_macro_ovr": 0.1682917960208278,
   "mcc": 0.1898476923854485,
   "predictions": [
     {
@@ -6533,5 +6533,7 @@
       "valid": true,
       "skipped": false
     }
-  ]
+  ],
+  "f1_macro": 0.14514765007096822,
+  "f1_weighted": 0.21903850323231172
 }

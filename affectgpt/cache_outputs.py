@@ -1,34 +1,3 @@
-"""
-Run AffectGPT inference and cache (a) raw text response and (b) per-candidate
-emotion logits at the first answer position to disk, one JSON record per sample.
-
-Per-sample record:
-    {
-      "name": ...,
-      "subtitle": ...,
-      "ground_truth_idx": ...,
-      "ground_truth_label": ...,
-      "response": "<generated text>",
-      "emotion_logits": {"anger": -3.2, "joy": -1.1, ...}   # raw model logits
-    }
-
-Logits capture works by wrapping `chat.model.<llm>.generate` so the score tensor
-from the first generated step is stashed during each call. Sampling-based
-text generation is unchanged (we still call chat.answer_sample as before); the
-wrapper only adds output_scores=True to grab the deterministic distribution
-that precedes the first sampled token.
-
-If the wrapper can't find a target generate method (AffectGPT internals differ
-from expectation), we fall back to caching only the text response and the
-metric script falls back to text parsing.
-
-Usage:
-    python cache_outputs.py \
-        --cfg-path train_configs/<the yaml> \
-        --datasets MELD \
-        --save_dir output/cache/<cond>-<preset>/ \
-        --options "inference.test_epoch=60"
-"""
 import argparse
 import glob
 import json
@@ -37,19 +6,109 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-# Compat shim: pytorchvideo imports torchvision.transforms.functional_tensor,
-# which torchvision removed in 0.17+. Alias to the merged module.
 try:
     import torchvision.transforms.functional_tensor  # noqa: F401
 except ModuleNotFoundError:
     import torchvision.transforms.functional as _tvf
     sys.modules["torchvision.transforms.functional_tensor"] = _tvf
 
+import numpy as np
 import torch
 import torch.backends.cudnn as cudnn
 
 import decord
 decord.bridge.set_bridge("torch")
+
+import cv2
+import mediapipe as mp
+
+from corruption_lib import (
+    get_corruption_config,
+    corrupt_text,
+    apply_audio_corruptions,
+    apply_video_corruptions,
+)
+
+
+_MP_FACE_SINGLETON = None
+
+
+def _get_mp_face():
+    global _MP_FACE_SINGLETON
+    if _MP_FACE_SINGLETON is None:
+        _MP_FACE_SINGLETON = mp.solutions.face_detection.FaceDetection(
+            model_selection=1, min_detection_confidence=0.5,
+        )
+    return _MP_FACE_SINGLETON
+
+
+def _extract_faces_from_frames(frames, target_size=224, padding_ratio=0.3):
+    mp_face = _get_mp_face()
+    output = []
+    last_good = None
+    prev_bbox = None
+
+    for frame in frames:
+        results = mp_face.process(frame)
+        chosen = None
+        if results.detections:
+            cands = []
+            h, w = frame.shape[:2]
+            for d in results.detections:
+                rb = d.location_data.relative_bounding_box
+                x1 = max(0, int(rb.xmin * w))
+                y1 = max(0, int(rb.ymin * h))
+                x2 = min(w, int((rb.xmin + rb.width) * w))
+                y2 = min(h, int((rb.ymin + rb.height) * h))
+                score = d.score[0] if d.score else 0.0
+                cands.append((x1, y1, x2, y2, score))
+            if prev_bbox is None:
+                chosen = max(cands, key=lambda b: b[4])
+            else:
+                pcx = (prev_bbox[0] + prev_bbox[2]) * 0.5
+                pcy = (prev_bbox[1] + prev_bbox[3]) * 0.5
+                chosen = min(cands, key=lambda b: (
+                    ((b[0] + b[2]) * 0.5 - pcx) ** 2
+                    + ((b[1] + b[3]) * 0.5 - pcy) ** 2
+                ))
+
+        face_crop = None
+        if chosen is not None:
+            x1, y1, x2, y2, _ = chosen
+            bw_ = x2 - x1
+            bh_ = y2 - y1
+            pad_w = int(bw_ * padding_ratio)
+            pad_h = int(bh_ * padding_ratio)
+            xa = max(0, x1 - pad_w)
+            ya = max(0, y1 - pad_h)
+            xb = min(frame.shape[1], x2 + pad_w)
+            yb = min(frame.shape[0], y2 + pad_h)
+            face_crop = frame[ya:yb, xa:xb]
+            prev_bbox = chosen
+        elif prev_bbox is not None:
+            x1, y1, x2, y2, _ = prev_bbox
+            x1 = max(0, min(frame.shape[1] - 1, x1))
+            y1 = max(0, min(frame.shape[0] - 1, y1))
+            x2 = max(0, min(frame.shape[1], x2))
+            y2 = max(0, min(frame.shape[0], y2))
+            face_crop = frame[y1:y2, x1:x2]
+
+        if face_crop is not None and face_crop.size > 0:
+            face_crop = cv2.resize(face_crop, (target_size, target_size))
+            last_good = face_crop
+        elif last_good is not None:
+            face_crop = last_good
+        else:
+            mn = min(frame.shape[:2])
+            cy_, cx_ = frame.shape[0] // 2, frame.shape[1] // 2
+            half = mn // 2
+            face_crop = frame[cy_ - half:cy_ + half, cx_ - half:cx_ + half]
+            face_crop = cv2.resize(face_crop, (target_size, target_size))
+
+        output.append(face_crop)
+
+    return np.stack(output).astype(np.uint8)
+
 
 from my_affectgpt.tasks import *
 from my_affectgpt.models import *
@@ -65,36 +124,17 @@ import config
 from toolkit.utils.read_files import *
 
 
-# ============================================================
-# Constants
-# ============================================================
-
 MELD_EMOS = ['anger', 'joy', 'sadness', 'neutral', 'disgust', 'fear', 'surprise']
 MELD_IDX2EMO = {i: emo for i, emo in enumerate(MELD_EMOS)}
-
-# CMUMOSEI sentiment is not handled below, but listed for parity with the
-# original eval. Add candidates here if you extend.
 CMUMOSEI_SENT = ['positive', 'negative', 'neutral']
 
 
-# ============================================================
-# Score-capture infrastructure
-# ============================================================
-
 class GenerateScoreCapture:
-    """Monkey-patches a model's `generate` method to capture per-step RAW
-    logits (pre-sampling-filter). Captures ALL steps so we can later find
-    the position where an emotion token was actually generated.
-
-    Uses transformers' `output_logits=True` (raw, pre-processor logits).
-    Falls back to `output_scores=True` if not supported, but those will be
-    -inf for tokens filtered out by top_p/top_k.
-    """
     def __init__(self):
         self._original = None
         self._target = None
-        self._all_logits = None     # tuple of [batch, vocab] tensors per step
-        self._sequences = None      # generated token IDs
+        self._all_logits = None
+        self._sequences = None
 
     def install(self, candidate_models):
         for cand in candidate_models:
@@ -105,18 +145,13 @@ class GenerateScoreCapture:
                 self._original = cand.generate
                 cap = self
                 def wrapper(*args, **kwargs):
-                    # Force greedy decoding & disable top-p/top-k so the captured
-                    # `scores` are RAW logits (no -inf filtering). This makes
-                    # candidate-emotion logits comparable across the 7 classes.
-                    # Trade-off: text response is now deterministic / greedy.
+                    # Force greedy + drop top_p/top_k so captured scores are raw
+                    # logits comparable across the 7 emotion classes.
                     kwargs["do_sample"] = False
                     kwargs["temperature"] = 1.0
                     kwargs.pop("top_p", None)
                     kwargs.pop("top_k", None)
                     kwargs.pop("typical_p", None)
-                    # Cap max_new_tokens — chat.answer_sample passes 1200 but
-                    # the response is ~10 tokens. Generating + storing 1200
-                    # logit tensors per sample blows GPU memory. Hard cap to 48.
                     kwargs["max_new_tokens"] = min(int(kwargs.get("max_new_tokens", 48)), 48)
                     kwargs.setdefault("output_logits", True)
                     kwargs.setdefault("output_scores", True)
@@ -129,29 +164,18 @@ class GenerateScoreCapture:
                     raw = getattr(out, "logits", None)
                     if raw is None or not raw:
                         raw = getattr(out, "scores", None)
-                    # Move to CPU immediately to free GPU memory
                     cap._all_logits = (
                         tuple(t.detach().cpu() for t in raw) if raw else None
                     )
                     cap._sequences = (out.sequences.detach().cpu()
                                       if hasattr(out, "sequences") else None)
-                    # Free GPU cache between samples
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
-                    # Diagnostic: print once on first call so we can verify
-                    # which logit source we got
-                    if not getattr(cap, "_diag_printed", False):
-                        kind = "logits (raw)" if getattr(out, "logits", None) else "scores (filtered, may be -inf)"
-                        n_steps = len(cap._all_logits) if cap._all_logits else 0
-                        print(f"[score-capture] using {kind}, captured {n_steps} steps", flush=True)
-                        cap._diag_printed = True
                     if hasattr(out, "sequences"):
                         return out.sequences
                     return out
                 cand.generate = wrapper
-                print(f"[score-capture] patched generate on {type(cand).__name__}")
                 return True
-        print("[score-capture] WARNING: no generate() target found; logits unavailable")
         return False
 
     def reset(self):
@@ -159,26 +183,15 @@ class GenerateScoreCapture:
         self._sequences = None
 
     def all_logits(self):
-        """Return tuple of [batch, vocab] logit tensors per generation step."""
         return self._all_logits
 
     def sequences(self):
         return self._sequences
 
 
-def find_emotion_step_logits(all_logits, sequences, emo_token_ids, prompt_len=None):
-    """Pick the step whose generated token matches an emotion first-token.
-
-    Returns the [vocab] logit tensor at that step (over the candidate set's
-    underlying vocab), or the last step's logits as a fallback.
-    """
+def find_emotion_step_logits(all_logits, sequences, emo_token_ids):
     if all_logits is None or sequences is None:
         return None
-    # sequences shape: [batch=1, total_len]. The first prompt_len tokens are
-    # input; the remaining are generated. all_logits[i] is the logits used to
-    # predict generated token i (so its argmax → sequences[batch, prompt_len + i]).
-    # We don't have prompt_len, but we can match by length: number of generated
-    # tokens equals len(all_logits).
     total_len = sequences.shape[-1]
     n_generated = len(all_logits)
     gen_start = total_len - n_generated
@@ -188,18 +201,11 @@ def find_emotion_step_logits(all_logits, sequences, emo_token_ids, prompt_len=No
     for i in range(n_generated):
         gen_token = int(sequences[0, gen_start + i].item())
         if gen_token in emo_id_set:
-            return all_logits[i][0]  # [vocab]
-    # No emotion token found in generation; return last step's logits as best-effort
+            return all_logits[i][0]
     return all_logits[-1][0]
 
 
 def get_emotion_first_token_ids(tokenizer, emotions):
-    """Return {emotion: first_token_id} using a leading-space variant first.
-
-    BPE tokenizers commonly produce different token boundaries depending on
-    whether the candidate is preceded by a space. We try " emotion" first
-    (chat-context typical) then fall back to "emotion".
-    """
     out = {}
     for emo in emotions:
         for prefix in (" ", ""):
@@ -211,7 +217,6 @@ def get_emotion_first_token_ids(tokenizer, emotions):
 
 
 def find_tokenizer(chat):
-    """Best-effort discovery of the LLM tokenizer used by AffectGPT."""
     candidates = [
         getattr(chat, "tokenizer", None),
         getattr(getattr(chat, "model", None), "llama_tokenizer", None),
@@ -224,7 +229,6 @@ def find_tokenizer(chat):
 
 
 def find_generate_targets(chat):
-    """Return a list of objects whose .generate we should consider patching."""
     cands = []
     m = getattr(chat, "model", None)
     if m is None:
@@ -235,10 +239,6 @@ def find_generate_targets(chat):
     return cands
 
 
-# ============================================================
-# Borrowed verbatim (config / model / dataset boilerplate)
-# ============================================================
-
 def search_for_ckpt_root(root_candidates):
     if len(root_candidates) == 0:
         return ''
@@ -246,7 +246,6 @@ def search_for_ckpt_root(root_candidates):
     targetroot = ''
     for root in root_candidates:
         count = len([p for p in os.listdir(root) if p.startswith('checkpoint_')])
-        print(root, '==>', count)
         if count > maxcount:
             maxcount = count
             targetroot = root
@@ -261,7 +260,7 @@ def get_ckpt3_candidates(ckpt3_root, inference_cfg):
     if inference_cfg.test_epoch != 'xxx':
         cur_epoch = inference_cfg.test_epoch
         ckpts = glob.glob("%s/*%06d*.pth" % (ckpt3_root, int(cur_epoch)))
-        assert len(ckpts) == 1, f'epoch {cur_epoch} not found / ambiguous'
+        assert len(ckpts) == 1
         return [ckpts[0]]
     elif inference_cfg.test_epochs == 'xxx-xxx':
         last_ckpt = sorted(glob.glob("%s/*.pth" % ckpt3_root))[-1]
@@ -302,6 +301,79 @@ def get_name2cls(name):
     return None
 
 
+def _to_numpy(t):
+    if t is None:
+        return None
+    if hasattr(t, "detach"):
+        return t.detach().cpu().numpy()
+    return t
+
+
+def _put_back(orig, arr):
+    if orig is None:
+        return None
+    if hasattr(orig, "detach"):
+        import torch as _torch
+        return _torch.from_numpy(arr.copy()).to(orig.device, dtype=orig.dtype)
+    return arr.astype(orig.dtype if hasattr(orig, "dtype") else arr.dtype)
+
+
+def apply_corruption_to_sample(sample_data, subtitle, corrupt_modalities, config,
+                                audio_sr=16000):
+    new_sub = subtitle
+    if "text" in corrupt_modalities:
+        new_sub = corrupt_text(
+            subtitle or "",
+            char_swap_prob=config["text_char_swap_prob"],
+            word_drop_prob=config["text_word_drop_prob"],
+        )
+
+    if "audio" in corrupt_modalities:
+        for key in ("raw_audio",):
+            if key in sample_data and sample_data[key] is not None:
+                try:
+                    arr = _to_numpy(sample_data[key]).astype(np.float32)
+                    shape = arr.shape
+                    wav = arr.reshape(-1)
+                    wav = apply_audio_corruptions(wav, audio_sr, config)
+                    arr = wav.reshape(shape).astype(np.float32)
+                    sample_data[key] = _put_back(sample_data[key], arr)
+                except Exception as e:
+                    print(f"  [warn] audio corrupt skipped on key={key}: {e}", flush=True)
+
+    if "video" in corrupt_modalities:
+        if "raw_frame" in sample_data and sample_data["raw_frame"] is not None:
+            try:
+                arr = _to_numpy(sample_data["raw_frame"])
+                if arr.ndim == 4 and arr.shape[-1] in (1, 3):
+                    was_float = arr.dtype != np.uint8
+                    if was_float:
+                        arr = (np.clip(arr, 0.0, 1.0) * 255).astype(np.uint8)
+                    corrupted_frames = apply_video_corruptions(arr, config)
+                    out = corrupted_frames
+                    if was_float:
+                        out = out.astype(np.float32) / 255.0
+                    sample_data["raw_frame"] = _put_back(sample_data["raw_frame"], out)
+
+                    if "raw_face" in sample_data and sample_data["raw_face"] is not None:
+                        try:
+                            target = sample_data["raw_face"].shape[-2] \
+                                if hasattr(sample_data["raw_face"], "shape") else 224
+                            target = 224 if target not in (96, 112, 128, 160, 224, 256) else target
+                            face_crops = _extract_faces_from_frames(
+                                corrupted_frames, target_size=int(target),
+                            )
+                            sample_data["raw_face"] = _put_back(
+                                sample_data["raw_face"], face_crops,
+                            )
+                        except Exception as e:
+                            print(f"  [warn] face re-extract failed: {e}", flush=True)
+            except Exception as e:
+                print(f"  [warn] video corrupt skipped: {e}", flush=True)
+
+    return sample_data, new_sub
+
+
 def run_inference_single(chat, dataset_cls, face_or_frame, sample_data,
                          subtitle, user_message):
     audio_hiddens, audio_llms = chat.postprocess_audio(sample_data)
@@ -327,26 +399,26 @@ def run_inference_single(chat, dataset_cls, face_or_frame, sample_data,
     )
 
 
-# ============================================================
-# Main loop
-# ============================================================
-
 def parse_args():
-    p = argparse.ArgumentParser(description="AffectGPT inference + response/logits cache")
+    p = argparse.ArgumentParser()
     p.add_argument("--cfg-path", required=True)
-    p.add_argument("--options", nargs="+",
-                   help="Override config (e.g. inference.test_epoch=60)")
+    p.add_argument("--options", nargs="+")
     p.add_argument("--datasets", nargs="+", default=['MELD'])
     p.add_argument("--outside_face_or_frame", default=None)
     p.add_argument("--save_dir", required=True)
     p.add_argument("--max_samples", type=int, default=0)
     p.add_argument("--resume", action="store_true")
+    p.add_argument("--corrupt_modalities", nargs="*", default=[],
+                   choices=["text", "audio", "video"])
+    p.add_argument("--corruption_preset", default="strong",
+                   choices=["mild", "medium", "strong"])
     return p.parse_args()
 
 
 def cache_dataset(chat, dataset_cls, face_or_frame, dataset_name,
                   test_names, name2subtitle, name2gt, max_samples,
-                  out_jsonl, resume, score_capture, emo_token_ids):
+                  out_jsonl, resume, score_capture, emo_token_ids,
+                  corrupt_modalities=None, corruption_config=None):
     if dataset_name == 'MELD':
         candidates = ",".join(MELD_EMOS)
         user_message = (
@@ -374,7 +446,6 @@ def cache_dataset(chat, dataset_cls, face_or_frame, dataset_name,
                     seen.add(json.loads(line)["name"])
                 except Exception:
                     pass
-        print(f"  resume: {len(seen)} already cached.")
 
     os.makedirs(os.path.dirname(out_jsonl) or ".", exist_ok=True)
     fout = open(out_jsonl, "a")
@@ -399,6 +470,10 @@ def cache_dataset(chat, dataset_cls, face_or_frame, dataset_name,
                 sample_data = dataset_cls.read_frame_face_audio_text(
                     video_path, face_npy, audio_path, image_path
                 )
+                if corrupt_modalities and corruption_config is not None:
+                    sample_data, subtitle = apply_corruption_to_sample(
+                        sample_data, subtitle, corrupt_modalities, corruption_config,
+                    )
                 if score_capture is not None:
                     score_capture.reset()
                 with torch.no_grad():
@@ -452,7 +527,6 @@ def main():
 
     os.makedirs(args.save_dir, exist_ok=True)
 
-    print("======== Step1: cfg pre-analysis ========")
     if inference_cfg.ckpt_root not in ['', 'xxx']:
         ckpt3_root = inference_cfg.ckpt_root
     elif inference_cfg.ckpt_name not in ['', 'xxx']:
@@ -466,29 +540,23 @@ def main():
     face_or_frame = get_face_or_frame(datasets_cfg, args.outside_face_or_frame)
 
     ckpt_3 = whole_ckpts[-1]
-    print(f"======== Step2: Loading model with ckpt_3: {os.path.basename(ckpt_3)} ========")
     model_cfg.ckpt_3 = ckpt_3
     model_cls = registry.get_model_class(model_cfg.arch)
     model = model_cls.from_config(model_cfg)
     model = model.to(device).eval()
     chat = Chat(model, model_cfg, device=device)
 
-    # ---- Install score capture
     score_capture = GenerateScoreCapture()
     score_capture.install(find_generate_targets(chat))
 
     tokenizer = find_tokenizer(chat)
     if tokenizer is None:
-        print("WARNING: tokenizer not found; emotion_logits will not be cached.")
         emo_token_ids = {}
     else:
         emo_token_ids = get_emotion_first_token_ids(tokenizer, MELD_EMOS + CMUMOSEI_SENT)
-        print(f"emo first-token IDs: {emo_token_ids}")
 
-    print("======== Step3: Cache outputs ========")
     for dataset_name in args.datasets:
         dataset_name = dataset_name.upper()
-        print(f"\nDataset: {dataset_name}")
         dataset_cls = get_name2cls(dataset_name)
         if dataset_cls is None:
             continue
@@ -511,14 +579,16 @@ def main():
         name2gt = dataset_cls.get_test_name2gt()
 
         out_jsonl = os.path.join(args.save_dir, f"{dataset_name.lower()}.jsonl")
+        corruption_config = None
+        if args.corrupt_modalities:
+            corruption_config = get_corruption_config(args.corruption_preset)
         cache_dataset(
             chat, dataset_cls, face_or_frame, dataset_name,
             test_names, name2subtitle, name2gt, args.max_samples,
             out_jsonl, args.resume, score_capture, emo_token_ids,
+            corrupt_modalities=args.corrupt_modalities,
+            corruption_config=corruption_config,
         )
-        print(f"  cached -> {out_jsonl}")
-
-    print("\nDone.")
 
 
 if __name__ == "__main__":

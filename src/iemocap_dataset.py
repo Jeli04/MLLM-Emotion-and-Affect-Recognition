@@ -1,10 +1,4 @@
-"""
-IEMOCAP dataset utilities.
-
-Expects CSV from scripts/build_iemocap_emotion_manifest.py with columns including
-utterance_id, text, emotion, wav_path, video_path (and optionally session, split).
-"""
-
+# iemocap data loader same format as meld data loader
 import math
 import random
 import string
@@ -12,7 +6,6 @@ import io
 import warnings
 from collections import Counter
 from pathlib import Path
-
 import av
 import librosa
 
@@ -20,6 +13,7 @@ try:
     import decord
 except ImportError:
     decord = None
+    
 import numpy as np
 import pandas as pd
 import torch
@@ -164,31 +158,36 @@ def get_corruption_config(preset="medium", **overrides):
 
 
 def _default_iemocap_root_from_manifest(manifest_path: Path) -> Path:
-    """.../IEMOCAP_full_release/manifests/*.csv -> .../IEMOCAP_full_release."""
     return manifest_path.resolve().parent.parent
 
 
 def _resolve_media_path(raw: str, iemocap_root: Path) -> str:
-    """Resolve manifest wav/video entries after folder moves or relative rows."""
     p = (raw or "").strip()
     if not p:
         return ""
+        
     path = Path(p)
     if path.is_file():
         return str(path.resolve())
+        
     rel = Path(p)
     if not rel.is_absolute():
         cand = iemocap_root / rel
+        
         if cand.is_file():
             return str(cand.resolve())
+            
     if path.is_absolute():
         parts = path.parts
+        
         for i, part in enumerate(parts):
             if part == "IEMOCAP_full_release" and i + 1 < len(parts):
                 tail = Path(*parts[i + 1 :])
                 cand = iemocap_root / tail
+                
                 if cand.is_file():
                     return str(cand.resolve())
+                    
                 break
     return p
 
@@ -205,17 +204,6 @@ class RawIEMOCAPDataset(Dataset):
         audio_sr=16000,
         max_samples=None,
     ):
-        """
-        Args:
-            manifest_path: path to iemocap utterance manifest CSV
-            split: optional split filter if a split column exists
-            sessions: optional list of session names (e.g. Session1)
-            label_type: currently supports 'emotion'
-            drop_no_agreement: whether to drop rows with no_agreement labels
-            load_audio: whether to load raw audio waveform
-            audio_sr: target audio sample rate
-            max_samples: optional cap for quick smoke tests
-        """
         self.manifest_path = Path(manifest_path)
         self.split = split
         self.sessions = sessions
@@ -227,6 +215,7 @@ class RawIEMOCAPDataset(Dataset):
 
         if not self.manifest_path.is_file():
             raise FileNotFoundError(f"Manifest not found: {self.manifest_path}")
+            
         if self.label_type != "emotion":
             raise ValueError("Only 'emotion' is supported in this version")
 
@@ -237,6 +226,7 @@ class RawIEMOCAPDataset(Dataset):
         for c in ["utterance_id", "recording_id", "session", "text", "emotion", "wav_path", "video_path"]:
             if c in self.df.columns:
                 self.df[c] = self.df[c].astype(str).str.strip()
+                
         if "emotion" in self.df.columns:
             self.df["emotion"] = self.df["emotion"].str.lower()
 
@@ -245,16 +235,19 @@ class RawIEMOCAPDataset(Dataset):
 
         if self.drop_no_agreement:
             self.df = self.df[self.df["emotion"] != "no_agreement"]
+            
         self.df = self.df[self.df["emotion"].isin(EMOTION2ID.keys())]
 
         if self.sessions:
             if "session" not in self.df.columns:
                 raise ValueError("sessions filter requested but manifest has no 'session' column")
+                
             self.df = self.df[self.df["session"].isin(self.sessions)]
 
         if self.split is not None:
             if "split" in self.df.columns:
                 self.df = self.df[self.df["split"].astype(str).str.strip() == str(self.split)]
+                
             else:
                 warnings.warn(
                     "Manifest has no 'split' column; ignoring split filter. "
@@ -265,6 +258,7 @@ class RawIEMOCAPDataset(Dataset):
         sort_cols = [c for c in ["session", "recording_id", "utterance_id"] if c in self.df.columns]
         if sort_cols:
             self.df = self.df.sort_values(sort_cols).reset_index(drop=True)
+            
         else:
             self.df = self.df.reset_index(drop=True)
 
@@ -278,8 +272,10 @@ class RawIEMOCAPDataset(Dataset):
         if audio_path and Path(audio_path).is_file():
             waveform, sr = librosa.load(audio_path, sr=self.audio_sr, mono=True)
             return waveform.astype(np.float32), sr
+            
         if video_path and Path(video_path).is_file():
             return load_audio_from_video(video_path, target_sr=self.audio_sr)
+            
         raise RuntimeError("No valid audio source for sample")
 
     def __getitem__(self, idx):
@@ -323,6 +319,7 @@ def _load_video_frames_torchvision(video_path, fps, temporal_patch_size):
     video, _, info = tvio.read_video(str(video_path), pts_unit="sec")
     if video.numel() == 0:
         raise RuntimeError(f"No frames in {video_path}")
+        
     total_frames = int(video.shape[0])
     video_fps = float(info.get("video_fps") or 25.0)
     num_frames = max(1, math.floor(total_frames / video_fps * fps))
@@ -350,38 +347,44 @@ def load_video_frames(video_path, fps=1, temporal_patch_size=2):
         num_frames = min(num_frames, total_frames)
         indices = np.linspace(0, total_frames - 1, num_frames, dtype=int)
         return vr.get_batch(indices).asnumpy()
+        
     return _load_video_frames_torchvision(path, fps, temporal_patch_size)
 
 
 def load_audio_from_video(path, target_sr=16000):
-    """Decode mono audio from an mp4 using PyAV, resampled to target_sr."""
     with av.open(str(path)) as container:
         stream = next((s for s in container.streams if s.type == "audio"), None)
         if stream is None:
             raise RuntimeError(f"No audio stream in {path}")
+            
         resampler = av.AudioResampler(format="flt", layout="mono", rate=target_sr)
         chunks = []
+        
         for frame in container.decode(stream):
             for resampled in resampler.resample(frame):
                 chunks.append(resampled.to_ndarray().reshape(-1))
+                
         for resampled in resampler.resample(None):
             chunks.append(resampled.to_ndarray().reshape(-1))
+            
     if not chunks:
         return np.zeros(0, dtype=np.float32), target_sr
+        
     return np.concatenate(chunks).astype(np.float32), target_sr
 
 
 def corrupt_text(text, char_swap_prob=0.1, word_drop_prob=0.1):
-    """Corrupt text by randomly swapping characters and dropping words."""
     words = text.split()
     if len(words) > 1:
         words = [w for w in words if random.random() > word_drop_prob]
+        
         if not words:
             words = [text.split()[0]]
 
     corrupted = []
     for word in words:
         chars = list(word)
+        
         for i in range(len(chars)):
             if random.random() < char_swap_prob:
                 chars[i] = random.choice(string.ascii_lowercase)
@@ -390,79 +393,88 @@ def corrupt_text(text, char_swap_prob=0.1, word_drop_prob=0.1):
 
 
 def corrupt_audio(waveform, noise_level=0.05):
-    """Add Gaussian noise to an audio waveform (numpy array)."""
     noise = np.random.randn(*waveform.shape).astype(waveform.dtype) * noise_level
     return waveform + noise
 
 
 def add_snr_noise(waveform, snr_db):
-    """Add Gaussian noise scaled to a target signal-to-noise ratio."""
     signal_power = float(np.mean(np.square(waveform)))
+    
     if signal_power <= 0:
         noise_std = 0.01
+        
     else:
         noise_power = signal_power / (10.0 ** (snr_db / 10.0))
         noise_std = math.sqrt(noise_power)
+        
     noise = np.random.randn(*waveform.shape).astype(np.float32) * noise_std
     return waveform.astype(np.float32) + noise
 
 
 def apply_audio_dropout(waveform, dropout_ratio, chunks):
-    """Silence random contiguous chunks of audio."""
     corrupted = waveform.astype(np.float32).copy()
+    
     if len(corrupted) == 0 or dropout_ratio <= 0 or chunks <= 0:
         return corrupted
 
     total_drop = max(1, int(len(corrupted) * dropout_ratio))
     chunk_len = max(1, total_drop // chunks)
+    
     for _ in range(chunks):
         if chunk_len >= len(corrupted):
             corrupted[:] = 0.0
             break
         start = random.randint(0, len(corrupted) - chunk_len)
         corrupted[start : start + chunk_len] = 0.0
+        
     return corrupted
 
 
 def apply_lowpass(waveform, sample_rate, cutoff_hz):
-    """Muffle speech with a low-pass filter."""
     if len(waveform) < 16 or cutoff_hz <= 0:
         return waveform
+        
     nyquist = sample_rate / 2.0
     if cutoff_hz >= nyquist:
         return waveform
+        
     sos = signal.butter(6, cutoff_hz / nyquist, btype="lowpass", output="sos")
     return signal.sosfiltfilt(sos, waveform).astype(np.float32)
 
 
 def apply_audio_corruptions(waveform, sample_rate, config):
-    """Apply configured audio corruptions in order."""
     corrupted = waveform.astype(np.float32).copy()
     for corruption in config["audio_corruptions"]:
         if corruption == "noise":
             corrupted = corrupt_audio(corrupted, noise_level=config["audio_noise_level"])
+            
         elif corruption == "snr_noise":
             corrupted = add_snr_noise(corrupted, snr_db=config["audio_snr_db"])
+            
         elif corruption == "dropout":
             corrupted = apply_audio_dropout(
                 corrupted,
                 dropout_ratio=config["audio_dropout_ratio"],
                 chunks=config["audio_dropout_chunks"],
             )
+            
         elif corruption == "clip":
             corrupted = np.clip(
                 corrupted * config["audio_clip_gain"],
                 -config["audio_clip_level"],
                 config["audio_clip_level"],
             ).astype(np.float32)
+            
         elif corruption == "lowpass":
             corrupted = apply_lowpass(
                 corrupted,
                 sample_rate=sample_rate,
                 cutoff_hz=config["audio_lowpass_hz"],
             )
+            
         else:
             raise ValueError(f"Unknown audio corruption: {corruption}")
+            
     return corrupted.astype(np.float32)
 
 
@@ -503,35 +515,43 @@ def apply_video_pixelation(frames, factor):
             Image.Resampling.BILINEAR,
         )
         output.append(np.asarray(small.resize((width, height), Image.Resampling.NEAREST)))
+        
     return np.stack(output).astype(np.uint8)
 
 
 def apply_video_frame_dropout(frames, drop_ratio):
     corrupted = frames.copy()
     frame_count = len(corrupted)
+    
     if frame_count == 0 or drop_ratio <= 0:
         return corrupted
+        
     drop_count = max(1, int(round(frame_count * drop_ratio)))
     drop_count = min(drop_count, frame_count)
     drop_indices = random.sample(range(frame_count), drop_count)
     corrupted[drop_indices] = 0
+    
     return corrupted
 
 
 def apply_video_freeze(frames):
     if len(frames) == 0:
         return frames
+        
     frozen = frames[random.randrange(len(frames))].copy()
+    
     return np.repeat(frozen[None, ...], len(frames), axis=0).astype(np.uint8)
 
 
 def apply_video_brightness_contrast(frames, brightness, contrast):
     output = []
+    
     for frame in frames:
         image = Image.fromarray(frame)
         image = ImageEnhance.Brightness(image).enhance(brightness)
         image = ImageEnhance.Contrast(image).enhance(contrast)
         output.append(np.asarray(image))
+        
     return np.stack(output).astype(np.uint8)
 
 
@@ -548,23 +568,25 @@ def apply_video_crop_resize(frames, crop_scale):
         image = Image.fromarray(frame)
         cropped = image.crop((x, y, x + crop_w, y + crop_h))
         output.append(np.asarray(cropped.resize((width, height), Image.Resampling.BILINEAR)))
+        
     return np.stack(output).astype(np.uint8)
 
 
 def apply_video_jpeg(frames, quality):
     output = []
     quality = max(1, min(95, int(quality)))
+    
     for frame in frames:
         image = Image.fromarray(frame)
         buffer = io.BytesIO()
         image.save(buffer, format="JPEG", quality=quality)
         buffer.seek(0)
         output.append(np.asarray(Image.open(buffer).convert("RGB")))
+        
     return np.stack(output).astype(np.uint8)
 
 
 def apply_video_corruptions(frames, config):
-    """Apply configured video corruptions in order."""
     corrupted = frames.astype(np.uint8).copy()
     for corruption in config["video_corruptions"]:
         if corruption == "noise":
@@ -590,12 +612,11 @@ def apply_video_corruptions(frames, config):
         elif corruption == "jpeg":
             corrupted = apply_video_jpeg(corrupted, config["video_jpeg_quality"])
         else:
-            raise ValueError(f"Unknown video corruption: {corruption}")
+            raise ValueError(f"invalid video corruption name {corruption}")
     return corrupted.astype(np.uint8)
 
 
 def corrupt_video_frames(video_path, noise_level=0.05):
-    """Return the video path as-is; frame-level noise is applied after decode."""
     return video_path
 
 
@@ -608,13 +629,13 @@ def get_corrupted_modalities(modalities, corrupt):
 def format_assistant_response(sample, modalities, corrupt, predict_corruption=False):
     if not predict_corruption:
         return sample["emotion"]
+        
     corrupted_modalities = get_corrupted_modalities(modalities, corrupt)
     corrupted_text = ",".join(corrupted_modalities) if corrupted_modalities else "none"
     return f"{sample['emotion']}\ncorrupted_modalities: {corrupted_text}"
 
 
 def build_messages(sample, modalities, corrupt=False, predict_corruption=False):
-    """Build chat messages for a single sample (same format as evaluate.py)."""
     user_content = []
     has_video = "video" in modalities
     for mod in modalities:
@@ -638,22 +659,7 @@ def build_messages(sample, modalities, corrupt=False, predict_corruption=False):
     return messages
 
 
-def compute_iemocap_eval_holdout_indices(
-    manifest_path,
-    *,
-    holdout_n=500,
-    holdout_seed=42,
-    sessions=None,
-    split=None,
-    drop_no_agreement=True,
-):
-    """Return (holdout_indices, remaining_indices) in canonical manifest row order.
-
-    The holdout is ``min(holdout_n, n)`` indices drawn with ``random.Random(holdout_seed)``,
-    matching the 500-sample / seed-42 eval convention and ``compute_iemocap_train_val_holdout_split``.
-
-    If ``holdout_n`` is 0, holdout is empty and remaining is ``list(range(n))``.
-    """
+def compute_iemocap_eval_holdout_indices(manifest_path,*,holdout_n=500,holdout_seed=42,sessions=None,split=None,drop_no_agreement=True,):
     base = RawIEMOCAPDataset(
         manifest_path,
         split=split,
@@ -664,7 +670,7 @@ def compute_iemocap_eval_holdout_indices(
     )
     n = len(base)
     if n == 0:
-        raise ValueError("No IEMOCAP samples after filtering; check manifest and filters.")
+        raise ValueError("no iemocap samples available after filtering")
 
     holdout_n = int(holdout_n) if holdout_n is not None else 0
     if holdout_n > 0:
@@ -679,28 +685,7 @@ def compute_iemocap_eval_holdout_indices(
     return holdout_indices, remaining_indices
 
 
-def compute_iemocap_train_val_holdout_split(
-    manifest_path,
-    *,
-    holdout_n=500,
-    holdout_seed=42,
-    val_ratio=0.1,
-    split_seed=43,
-    sessions=None,
-    split=None,
-    drop_no_agreement=True,
-):
-    """Split manifest indices into train, validation, and an eval holdout set.
-
-    Uses the same row ordering as ``RawIEMOCAPDataset`` (filter, optional session/split
-    column, then stable sort). The holdout is a random sample of ``holdout_n`` indices
-    with ``holdout_seed`` (default matches common 500-sample eval settings). Train and
-    validation are disjoint from holdout; they partition the remaining indices with
-    ``val_ratio`` and ``split_seed``.
-
-    Returns:
-        train_indices, val_indices, holdout_indices (each a sorted list of ints).
-    """
+def compute_iemocap_train_val_holdout_split(manifest_path,*,holdout_n=500,holdout_seed=42,val_ratio=0.1,split_seed=43,sessions=None,split=None,drop_no_agreement=True,):
     holdout_indices, remaining = compute_iemocap_eval_holdout_indices(
         manifest_path,
         holdout_n=holdout_n,
@@ -710,7 +695,7 @@ def compute_iemocap_train_val_holdout_split(
         drop_no_agreement=drop_no_agreement,
     )
     if not remaining:
-        raise ValueError("No samples left for training after holdout; reduce holdout_n.")
+        raise ValueError("hold out too high no samples left")
 
     val_ratio = float(val_ratio)
     rng_s = random.Random(int(split_seed))
@@ -720,8 +705,8 @@ def compute_iemocap_train_val_holdout_split(
     if val_ratio <= 0 or len(order) == 1:
         train_indices = sorted(order)
         val_indices = []
+        
     else:
-        # At least one train and one val when val_ratio > 0 and len >= 2.
         val_n = min(
             len(order) - 1,
             max(1, int(round(len(order) * val_ratio))),
@@ -732,43 +717,24 @@ def compute_iemocap_train_val_holdout_split(
     return train_indices, val_indices, holdout_indices
 
 
-def iemocap_train_subset_sample_weights(
-    train_indices,
-    raw_df: pd.DataFrame,
-    *,
-    power: float = 0.5,
-    max_ratio_to_majority: float = 40.0,
-) -> torch.Tensor:
-    """Build per-row weights for ``Subset(train_indices)`` (same order as ``train_indices``).
-
-    For each emotion class with ``n_c`` train samples and ``n_max = max_c n_c``, assign
-    every sample in that class weight::
-
-        min((n_max / n_c) ** power, max_ratio_to_majority)
-
-    ``power=0.5`` (sqrt) mildly upsamples tails; the cap prevents extreme resampling when
-    ``n_c`` is 1–3 (e.g. disgusted/other in IEMOCAP).
-
-    Args:
-        train_indices: indices into ``raw_df`` rows (same convention as ``RawIEMOCAPDataset``).
-        raw_df: ``RawIEMOCAPDataset.df`` after the same filters as training data.
-        power: exponent on ``n_max / n_c``; ``1.0`` is linear inverse-frequency style.
-        max_ratio_to_majority: clip relative boost vs the majority class per-sample weight.
-
-    Returns:
-        Float64 tensor of shape ``(len(train_indices),)`` for ``WeightedRandomSampler``.
-    """
+def iemocap_train_subset_sample_weights(train_indices,raw_df: pd.DataFrame,*,power: float = 0.5,max_ratio_to_majority: float = 40.0,) -> torch.Tensor:
+    
     train_indices = list(train_indices)
     counts: Counter[str] = Counter()
     for i in train_indices:
         emo = str(raw_df.iloc[int(i)]["emotion"]).strip().lower()
+        
         if emo not in EMOTION2ID:
             continue
+            
         counts[emo] += 1
+        
     if not counts:
         raise ValueError("iemocap_train_subset_sample_weights: empty or unlabeled train_indices")
+        
     n_max = max(counts.values())
     class_weight = {}
+    
     for emo, nc in counts.items():
         raw_ratio = (n_max / float(nc)) ** float(power)
         class_weight[emo] = float(min(raw_ratio, max_ratio_to_majority))
@@ -777,16 +743,11 @@ def iemocap_train_subset_sample_weights(
     for i in train_indices:
         emo = str(raw_df.iloc[int(i)]["emotion"]).strip().lower()
         weights.append(class_weight.get(emo, 1.0))
+        
     return torch.tensor(weights, dtype=torch.double)
 
 
 class CorruptedIEMOCAPDataset(Dataset):
-    """IEMOCAP dataset with optional corruption applied to raw modality data.
-
-    When `distill=True`, __getitem__ returns a paired {"full": ..., "mask": ...}
-    dict unless `include_full_branch=False`, matching CorruptedMELDDataset.
-    """
-
     def __init__(
         self,
         manifest_path,
@@ -908,8 +869,7 @@ class CorruptedIEMOCAPDataset(Dataset):
                 messages[:-1], tokenize=False, add_generation_prompt=True,
             )
         else:
-            # Evaluation should not include the assistant label turn; otherwise
-            # the ground-truth emotion leaks into the model input prompt.
+            # fix ground truth label leaking into prompt message 
             rendered_text = self.processor.apply_chat_template(
                 messages[:-1], tokenize=False, add_generation_prompt=True,
             )
@@ -980,7 +940,7 @@ class CorruptedIEMOCAPDataset(Dataset):
             try:
                 frames = self._load_video_frames(sample["video_path"], self.fps)
             except Exception:
-                # 2 black frames (minimum for temporal_patch_size=2), 224x224 RGB
+            
                 frames = np.zeros((2, 224, 224, 3), dtype=np.uint8)
         if "audio" in self.modalities:
             try:
@@ -1037,7 +997,6 @@ class CorruptedIEMOCAPDataset(Dataset):
 
 
 def _collate_single(batch, pad_token_id, padding_side, label_pad_id):
-    """Collate a flat list of per-sample dicts (no 'full'/'mask' nesting)."""
     def pad_1d(seqs, pad_value):
         max_len = max(s.size(0) for s in seqs)
         out = []
@@ -1102,7 +1061,6 @@ def _collate_single(batch, pad_token_id, padding_side, label_pad_id):
 
 
 def collate_fn(batch, pad_token_id, padding_side="left", label_pad_id=-100):
-    """Collate per-sample dicts from CorruptedIEMOCAPDataset into a padded batch."""
     if "full" in batch[0] or "mask" in batch[0]:
         mask = _collate_single([b["mask"] for b in batch], pad_token_id, padding_side, label_pad_id)
         out = {"mask": mask}
@@ -1122,6 +1080,4 @@ def collate_fn(batch, pad_token_id, padding_side="left", label_pad_id=-100):
 
     return _collate_single(batch, pad_token_id, padding_side, label_pad_id)
 
-
-# Backward compatibility with prior name used in this repo.
 ManifestIEMOCAPDataset = RawIEMOCAPDataset

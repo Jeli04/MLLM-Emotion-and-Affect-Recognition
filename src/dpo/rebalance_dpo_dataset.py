@@ -1,22 +1,3 @@
-"""Rebalance an existing DPO dataset toward minority classes.
-
-Operates on the JSON produced by ``build_dpo_dataset.py``. Three operations,
-applied in order:
-
-  1) Keep all pairs where ``chosen`` is a minority class.
-  2) Optionally retain a fraction of the original majority-``chosen`` pairs as
-     anchor examples so the model does not forget when a majority label is
-     genuinely correct.
-  3) For each kept minority-``chosen`` pair, synthesize new pairs with the
-     ``rejected`` label forced to each anti-majority target. This adds direct
-     contrastive pressure pushing the policy away from majority-class fallback
-     when the gold is rare. Synthesized pairs that would duplicate an existing
-     pair (same prompt, same chosen, same rejected) are skipped.
-
-No model inference is required — synthesis just rewrites the assistant turn of
-``rejected_messages`` with the new label.
-"""
-
 import argparse
 import copy
 import json
@@ -38,6 +19,8 @@ def parse_args():
                         help="Path to dpo_samples_*.json produced by build_dpo_dataset.py")
     parser.add_argument("--output", required=True,
                         help="Path to write the rebalanced dpo_samples_*.json")
+
+  
     parser.add_argument("--minority", nargs="+", default=MELD_MINORITY_DEFAULT,
                         help="Class labels considered minority (kept by default). "
                              f"Default (MELD): {MELD_MINORITY_DEFAULT}")
@@ -49,6 +32,8 @@ def parse_args():
     parser.add_argument("--anchor_majority_fraction", type=float, default=0.0,
                         help="Fraction of original majority-chosen pairs to retain as "
                              "anchors (default 0.0 = drop them all). Range [0,1].")
+
+  
     parser.add_argument("--anchor_seed", type=int, default=42,
                         help="RNG seed for sampling anchor majority pairs.")
     parser.add_argument("--no_synth_when_existing", action="store_true",
@@ -61,7 +46,6 @@ def parse_args():
 
 
 def synthesize_pair(base_sample, new_rejected):
-    """Clone a DPO sample and replace rejected with a new label."""
     new_sample = copy.deepcopy(base_sample)
     new_sample["rejected"] = new_rejected
     new_sample["confusion_pair"] = {
@@ -78,14 +62,13 @@ def synthesize_pair(base_sample, new_rejected):
 
 
 def pair_key(sample):
-    """Deduplication key: same prompt sample + chosen + rejected."""
     return (sample["sample_index"], sample["chosen"], sample["rejected"])
 
 
 def main():
     args = parse_args()
     minority = set(args.minority)
-    anti_targets = list(dict.fromkeys(args.anti_majority_targets))  # de-dup, preserve order
+    anti_targets = list(dict.fromkeys(args.anti_majority_targets))  
 
     with open(args.input) as f:
         data = json.load(f)
